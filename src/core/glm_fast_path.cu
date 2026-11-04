@@ -7122,7 +7122,7 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
         if (!glmfast::cuda_ok(dn, "glm link spec hop out", err) || !F->route_ok(err)) return false;
         return gl::send_hop(p, 1, spec_hop_h_[sl], hop_b, err);
     };
-    // back: the tail for p from the last of k row sets the front sends for it
+    // back: the tail for p from the rows in slot p & 1, after k more row sets for p (the last one stands)
     const auto tail_at = [&](int64_t p, int k) -> bool {
         const int sl = (int) (p & 1);
         for (int i = 0; i < k; ++i)
@@ -7179,6 +7179,8 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
                 return false;
             }
         } else {
+            // (the head's speculative rows for qp+1 went out before this verdict: they come first)
+            if (!first && !gl::recv_hop(qp + 1, 1, spec_hop_h_[(qp + 1) & 1], hop_b, err)) return false;
             int v = 0, unused = 0;
             if (!gl::recv_pair(gl::kCtl, qp, v, unused, err)) return false;
             more = v != 0;
@@ -7210,10 +7212,7 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
             ok = false;
             break;
         }
-        if (!more) {   // the head's speculative rows for q+2 are on their way: the back reads them away
-            if (!front && !gl::recv_hop(q + 2, 1, spec_hop_h_[(q + 2) & 1], hop_b, err)) ok = false;
-            break;
-        }
+        if (!more) break;   // (the back has read the head's speculative rows for q+2 in step)
         const bool wrong = d != y2;
         ++spec_steps_;
         if (!wrong) ++spec_hits_;
@@ -7230,7 +7229,7 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
                 ok = false;
                 break;
             }
-        } else if (!tail_at(q + 2, wrong ? 2 : 1)) {
+        } else if (!tail_at(q + 2, wrong ? 1 : 0)) {   // (a wrong draft: the redo's rows replace them)
             ok = false;
             break;
         }
