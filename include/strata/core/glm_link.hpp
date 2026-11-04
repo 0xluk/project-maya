@@ -23,6 +23,8 @@
 // unset: loopback only).  Malformed lengths (an ERR over 4 KiB, a payload on a message without one, a packed block
 // that does not fit its own length) are protocol errors: the link drops.
 // Several local GPUs per side: --layer-split K:b1,b2,.. (glm_model.cu load_pack_place).
+// STRATA_GLM_LINK_KEY_FILE / MAYA_GLM_LINK_KEY_FILE: a shared key (>= 32 bytes) - every connection runs an HMAC-SHA256
+// challenge-response both ways before HELLO (glm_link.cpp); a connection that fails it is closed.
 #pragma once
 
 #include <cstddef>
@@ -50,6 +52,8 @@ constexpr int64_t kVersion = 2;
 Role role();                          // from STRATA_GLM_ROLE / MAYA_GLM_ROLE (cached)
 const char* role_name();
 bool up();                            // the link is connected and healthy
+// the link key (MAYA_GLM_LINK_KEY_FILE): false + err when it is set and the file is missing or short (checked at load)
+bool key_ready(std::string& err);
 
 // open the link (front: connect, retrying up to STRATA_GLM_LINK_WAIT seconds, default 1800; back: listen, accept both
 // connections) and exchange HELLO.  my_chunk: this side's prompt chunk; peer_chunk: the other side's.
