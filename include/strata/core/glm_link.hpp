@@ -12,7 +12,12 @@
 //   data: framed messages (Hdr + payload), TCP_NODELAY.  front -> back: HELLO, HOP (residual rows of n positions from
 //         pos, n x hc x n_embd fp32); back -> front: HELLO, TOK (a token picked at pos), ERR (text)
 //   ctl:  newline-terminated control lines, front -> back (the back's stdin)
-// Any link failure is fatal for the request on both sides, and the link stays down (the engine has to be restarted).
+// Any link failure fails the request on both sides and takes the link down; the front connects again at its next
+// command (STRATA_GLM_RELINK_WAIT seconds, default 5) and the back, which stays up, accepts it (Phase 2).
+// Every request is bracketed: kBegin (both sides' reuse length and decode mode: a mismatch reads the prompt from 0)
+// and kEnd/kAck (the front's end: the back stops wherever it waits - kEnd in place of any message is a cancel - and
+// acknowledges with its position; anything stale before the marker is dropped).
+// STRATA_GLM_LINK_BF16=1 (default): the boundary rows cross as bf16 (rounded to nearest even, upcast on the back).
 #pragma once
 
 #include <cstddef>
@@ -22,7 +27,7 @@
 namespace strata::core::glmlink {
 
 enum Role : int { kNone = 0, kFront = 1, kBack = 2 };
-enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7 };
+enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7, kBegin = 8, kEnd = 9, kAck = 10 };
 // kSpec (back -> front, the pipelined spec decode): pos = the tail's position, val = its token y, n = the draft d for
 // the position after (-1: none).  kCtl (front -> back): pos = the position the step is for, val = 1 go on / 0 the end
 
@@ -35,7 +40,7 @@ struct Hdr {
     uint64_t bytes;   // payload bytes that follow; HELLO: max context
 };
 constexpr uint32_t kMagic = 0x4b4e4c4d;   // "MLNK"
-constexpr int64_t kVersion = 1;
+constexpr int64_t kVersion = 2;
 
 Role role();                          // from STRATA_GLM_ROLE / MAYA_GLM_ROLE (cached)
 const char* role_name();
@@ -60,6 +65,21 @@ bool recv_pair(Type t, int64_t pos, int32_t& val, int32_t& n, std::string& err);
 void ctl_send_line(const std::string& line);
 void ctl_close();                     // front: no more lines (EOF on the back)
 int ctl_fd();                         // back: the fd to read the control lines from
+
+// Phase 2: requests, cancel, reconnect
+void request_begin();                 // both sides, a request's start: no cancel seen yet
+bool cancelled();                     // the back: the front's kEnd came in place of what it waited for (err "cancelled")
+// both: the request's start - the front sends (reuse, mode), the back answers with its own
+bool begin_exchange(int64_t reuse, int32_t mode, int64_t& peer_reuse, int32_t& peer_mode, std::string& err);
+// the front: kEnd{pos, flags}, then everything up to the back's kAck is dropped; agree: the back stands at pos too
+bool end_front(int64_t pos, int32_t flags, bool& agree, std::string& err);
+// the back: (unless the kEnd came already) everything up to the front's kEnd is dropped, then kAck{pos, agree}
+bool end_back(int64_t pos, int32_t& flags, bool& agree, std::string& err);
+bool bf16();                          // the hop's wire format
+bool idle_check();                    // the front between commands: false if the back has gone (the link is down)
+bool reopen(std::string& err);        // the front: connect again (STRATA_GLM_RELINK_WAIT s)
+void wake();                          // the back: the old link's data socket shut (a main thread blocked on it returns)
+bool reaccept(std::string& err);      // the back: accept the front's next connection and HELLO
 
 // stats (stderr at exit): hops, bytes, time blocked in send/recv
 void report();

@@ -271,6 +271,7 @@ public:
     /// closes the reasoning block this way inside the running decode - the speculative loop takes it as the truth
     /// for its position, like a rejected draft, so nothing is read again.
     void force_next(int32_t tok) { force_tok_ = tok; }
+    int32_t force_pending() const { return force_tok_; }   // (the two-box split: the front's, sent to the back)
     /// The on-demand vision encoder (serve VLEND / VRECLAIM; STRATA_GLM_VISION_LEND_MB at load): the first GPU's
     /// lendable pool tail is emptied and freed so the encoder's process can use that VRAM, and allocated again
     /// once it has ended (false while the memory is still taken).  vision_lend_bytes(): 0 when unavailable.

@@ -7111,6 +7111,7 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
                 return false;
             }
     const auto fail = [&]() -> bool {   // either side's failure ends the link (the other one waits on it)
+        if (gl::cancelled()) return false;   // (the back: the front's kEnd - not a failure, the link stays up)
         gl::abort_link(err.empty() ? "the spec decode failed" : err);
         return false;
     };
@@ -7174,16 +7175,18 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
         const bool e = emit(y);
         if (front) {
             more = e && produced < max_new && qp + 2 < max_ctx_ && d >= 0;
-            if (!gl::send_pair(gl::kCtl, qp, more ? 1 : 0, 0)) {
+            // (with the verdict the token the next step must take, if any - a WRAP, the budget, the loop guard)
+            if (!gl::send_pair(gl::kCtl, qp, more ? 1 : 0, force_tok_)) {
                 err = "glm link: down";
                 return false;
             }
         } else {
             // (the head's speculative rows for qp+1 went out before this verdict: they come first)
             if (!first && !gl::recv_hop(qp + 1, 1, spec_hop_h_[(qp + 1) & 1], hop_b, err)) return false;
-            int v = 0, unused = 0;
-            if (!gl::recv_pair(gl::kCtl, qp, v, unused, err)) return false;
+            int v = 0, fz = -1;
+            if (!gl::recv_pair(gl::kCtl, qp, v, fz, err)) return false;
             more = v != 0;
+            force_tok_ = fz;   // (the front's force stands: its WRAP / budget / guard - the back's own is replaced)
             if (more != (e && produced < max_new && qp + 2 < max_ctx_))
                 std::fprintf(stderr, "glm link: the back's emit disagrees at position %lld (the front's verdict holds)\n",
                              (long long) qp);
@@ -7930,7 +7933,8 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
     for (int32_t t : tokens) {
         const auto t0 = std::chrono::steady_clock::now();
         if (!fast_token(t, err)) {
-            if (strata::core::glmlink::role() == strata::core::glmlink::kBack) strata::core::glmlink::abort_link(err);   // (the front waits for this token)
+            if (strata::core::glmlink::role() == strata::core::glmlink::kBack && !strata::core::glmlink::cancelled())
+                strata::core::glmlink::abort_link(err);   // (the front waits for this token; a cancel is not a failure)
             return false;
         }
         F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
