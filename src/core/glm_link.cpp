@@ -36,6 +36,7 @@ bool g_cancel = false;
 int64_t g_end_pos = -1;
 int32_t g_end_flags = 0;
 bool g_bf16 = true;
+bool g_pack = true;   // STRATA_GLM_LINK_PACK: the bf16 rows' high bytes nibble-coded (lossless)
 std::mutex g_ctl_mu;
 // stats
 uint64_t s_hops = 0, s_hop_bytes = 0, s_toks = 0;
@@ -194,7 +195,8 @@ bool reaccept(std::string& err) { err = "glm link: not on Windows"; return false
 static std::string link_config() {
     const char* mc = std::getenv("STRATA_GLM_PREFILL_MIN_CHUNKS");
     if (mc == nullptr || !mc[0]) mc = std::getenv("MAYA_GLM_PREFILL_MIN_CHUNKS");
-    return std::string("bf16=") + (g_bf16 ? "1" : "0") + " min_chunks=" + (mc != nullptr ? mc : "");
+    return std::string("bf16=") + (g_bf16 ? "1" : "0") + " pack=" + (g_bf16 && g_pack ? "1" : "0") +
+           " min_chunks=" + (mc != nullptr ? mc : "");
 }
 
 static bool hello(std::string& err) {
@@ -318,6 +320,8 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
     g_ctx = max_ctx;
     g_my_chunk = my_chunk;
     if (const char* b = env2("STRATA_GLM_LINK_BF16", "MAYA_GLM_LINK_BF16")) g_bf16 = std::atoi(b) != 0;
+    if (const char* b = env2("STRATA_GLM_LINK_PACK", "MAYA_GLM_LINK_PACK")) g_pack = std::atoi(b) != 0;
+    if (!g_bf16) g_pack = false;
     const auto t0 = std::chrono::steady_clock::now();
     if (role() == kFront) {
         double wait_s = 1800;
@@ -429,13 +433,94 @@ static inline uint16_t f2bf(float f) {
     return (uint16_t) (u >> 16);
 }
 
+// THE PACKED HOP (STRATA_GLM_LINK_PACK=1, default with bf16; lossless): a bf16 value's high byte (sign and 7 exponent
+// bits) takes few values in a residual row (entropy ~3.2 bits, the 15 commonest ~98.5%), so each block sends its low
+// bytes as they are, the high bytes as 4-bit codes into the block's table of its 15 commonest (15: escape, the byte
+// follows in the escape list) - ~12.1 bits a value instead of 16.  A block: u32 payload bytes, u32 values, u32 escapes,
+// u8 table[16], then low bytes, nibbles, escapes.
+struct PackHdr {
+    uint32_t len, k, n_esc;
+    uint8_t table[16];
+};
+static size_t pack_block(const float* src, size_t k, std::vector<uint8_t>& out) {
+    thread_local std::vector<uint16_t> b;
+    b.resize(k);
+    uint32_t hist[256] = {0};
+    for (size_t j = 0; j < k; ++j) {
+        b[j] = f2bf(src[j]);
+        ++hist[b[j] >> 8];
+    }
+    PackHdr h{};
+    uint8_t code[256];
+    std::memset(code, 15, sizeof code);
+    for (int t = 0; t < 15; ++t) {   // the 15 commonest high bytes
+        int best = -1;
+        for (int v = 0; v < 256; ++v)
+            if (code[v] == 15 && hist[v] > 0 && (best < 0 || hist[v] > hist[best])) best = v;
+        if (best < 0) break;
+        code[best] = (uint8_t) t;
+        h.table[t] = (uint8_t) best;
+    }
+    size_t n_esc = 0;
+    for (int v = 0; v < 256; ++v)
+        if (code[v] == 15) n_esc += hist[v];
+    const size_t nb = (k + 1) / 2, total = sizeof(PackHdr) + k + nb + n_esc;
+    out.resize(total);
+    uint8_t* lo = out.data() + sizeof(PackHdr);
+    uint8_t* nib = lo + k;
+    uint8_t* esc = nib + nb;
+    std::memset(nib, 0, nb);
+    size_t e = 0;
+    for (size_t j = 0; j < k; ++j) {
+        const uint8_t hi = (uint8_t) (b[j] >> 8), c = code[hi];
+        lo[j] = (uint8_t) b[j];
+        nib[j >> 1] |= (uint8_t) (c << ((j & 1) * 4));
+        if (c == 15) esc[e++] = hi;
+    }
+    h.len = (uint32_t) (total - 4);
+    h.k = (uint32_t) k;
+    h.n_esc = (uint32_t) n_esc;
+    std::memcpy(out.data(), &h, sizeof h);
+    return total;
+}
+static bool unpack_block(const uint8_t* p, size_t k_want, uint32_t* dst) {
+    PackHdr h;
+    std::memcpy(&h, p, sizeof h);
+    if (h.k != k_want) return false;
+    const uint8_t* lo = p + sizeof(PackHdr);
+    const uint8_t* nib = lo + h.k;
+    const uint8_t* esc = nib + (h.k + 1) / 2;
+    size_t e = 0;
+    for (size_t j = 0; j < h.k; ++j) {
+        const uint8_t c = (uint8_t) ((nib[j >> 1] >> ((j & 1) * 4)) & 15);
+        const uint8_t hi = c == 15 ? (e < h.n_esc ? esc[e++] : 0) : h.table[c];
+        dst[j] = ((uint32_t) hi << 24) | ((uint32_t) lo[j] << 16);
+    }
+    return e == h.n_esc;
+}
+
 bool send_hop(int64_t pos, int n, const void* data, size_t bytes, std::string& err) {
     if (!up()) { err = "glm link: down"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
     bool ok;
+    size_t wire_total = 0;
     if (!g_bf16) {
         Hdr h{kMagic, kHop, pos, n, 0, (uint64_t) bytes};
         ok = send_msg(h, data, bytes);
+    } else if (g_pack) {
+        // (the header carries the values, not the bytes: the blocks say their own length)
+        thread_local std::vector<uint8_t> st;
+        const size_t nv = bytes / sizeof(float);
+        const float* src = (const float*) data;
+        Hdr h{kMagic, kHop, pos, n, 2, (uint64_t) nv};
+        ok = true;
+        for (size_t i = 0; ok && i < nv; i += kBlk) {
+            const size_t k = std::min(kBlk, nv - i);
+            const size_t w = pack_block(src + i, k, st);
+            wire_total += w;
+            ok = i == 0 ? send_msg(h, st.data(), w) : write_all(g_data, st.data(), w);
+        }
+        if (nv == 0) ok = send_msg(h, nullptr, 0);
     } else {
         thread_local std::vector<uint16_t> st;
         const size_t nv = bytes / sizeof(float);
@@ -456,7 +541,7 @@ bool send_hop(int64_t pos, int n, const void* data, size_t bytes, std::string& e
     }
     s_send_ms += ms_since(t0);
     ++s_hops;
-    s_hop_bytes += g_bf16 ? bytes / 2 : bytes;
+    s_hop_bytes += g_pack ? wire_total : g_bf16 ? bytes / 2 : bytes;
     return true;
 }
 
@@ -492,8 +577,8 @@ bool recv_hop(int64_t pos, int n, void* dst, size_t bytes, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
     Hdr h{};
     if (!recv_hdr(h, kHop, err)) return false;
-    const size_t wire = g_bf16 ? bytes / 2 : bytes;
-    if (h.pos != pos || h.n != n || h.bytes != wire || h.val != (g_bf16 ? 1 : 0)) {
+    size_t wire = g_pack ? bytes / 4 : g_bf16 ? bytes / 2 : bytes;   // (packed: the header carries the values)
+    if (h.pos != pos || h.n != n || h.bytes != wire || h.val != (g_pack ? 2 : g_bf16 ? 1 : 0)) {
         fail(err, "HOP for positions " + std::to_string((long long) h.pos) + "+" + std::to_string(h.n) +
                       ", expected " + std::to_string((long long) pos) + "+" + std::to_string(n) + " (out of step)");
         return false;
@@ -501,6 +586,22 @@ bool recv_hop(int64_t pos, int n, void* dst, size_t bytes, std::string& err) {
     bool ok;
     if (!g_bf16) {
         ok = read_all(g_data, dst, bytes);
+    } else if (g_pack) {
+        thread_local std::vector<uint8_t> st;
+        const size_t nv = bytes / sizeof(float);
+        uint32_t* out = (uint32_t*) dst;
+        ok = true;
+        wire = 0;
+        for (size_t i = 0; ok && i < nv; i += kBlk) {
+            const size_t k = std::min(kBlk, nv - i);
+            uint32_t len = 0;
+            ok = read_all(g_data, &len, 4) && len >= sizeof(PackHdr) - 4 && len <= 4 * kBlk;
+            if (!ok) break;
+            st.resize(len + 4);
+            std::memcpy(st.data(), &len, 4);
+            ok = read_all(g_data, st.data() + 4, len) && unpack_block(st.data(), k, out + i);
+            wire += len + 4;
+        }
     } else {
         thread_local std::vector<uint16_t> st;
         const size_t nv = bytes / sizeof(float);
@@ -629,6 +730,23 @@ static bool drain_until(uint32_t t, Hdr& h, int& dropped, std::string& err) {
             return false;
         }
         ++dropped;
+        if (h.type == kHop && h.val == 2) {   // a packed hop: its blocks say their length
+            for (uint64_t left = h.bytes; left > 0;) {
+                uint32_t len = 0, k = 0;
+                if (!read_all(g_data, &len, 4) || len < 4 || len > 4 * kBlk) {
+                    fail(err, "the connection is lost");
+                    return false;
+                }
+                junk.resize(len);
+                if (!read_all(g_data, junk.data(), len)) {
+                    fail(err, "the connection is lost");
+                    return false;
+                }
+                std::memcpy(&k, junk.data(), 4);
+                left -= std::min<uint64_t>(left, k == 0 ? left : k);
+            }
+            continue;
+        }
         for (uint64_t left = h.bytes; left > 0;) {
             const size_t k = (size_t) std::min<uint64_t>(left, 1 << 20);
             junk.resize(k);
