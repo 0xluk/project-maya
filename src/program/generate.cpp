@@ -2407,7 +2407,8 @@ static int glm_pack_generate(const Options& o) {
             // STOP, a WRAP or the budget's force lands at the same token on both sides)
             const bool lfront = gl::role() == gl::kFront, lback = gl::role() == gl::kBack;
             for (;;) {
-                if (stop_req.load()) {
+                // (a read that ended cancelled - on the two-box back by the front's kEnd, where stop_req is never set)
+                if (stop_req.load() || std::strcmp(finish, "cancel") == 0) {
                     finish = "cancel";
                     break;
                 }
