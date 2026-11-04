@@ -15,6 +15,7 @@
 // Victims come only from the requesting layer's own slot partition, so no kernel can be reading a
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
+#include "strata/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
@@ -1641,7 +1642,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
-            budget = l1_ >= g.n_layers ? remaining
+            budget = l1_ >= g.n_layers || strata::core::glmlink::role() != strata::core::glmlink::kNone ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
             // a later part: no more than is free now, less what is still to come and half the headroom (a parallel
@@ -6001,6 +6002,15 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         last->mtp_hx_pos_ = -1;
     }
     cudaSetDevice(dev_);
+    namespace gl = strata::core::glmlink;
+    const gl::Role lrole = gl::role();
+    const size_t link_b = (size_t) g.hc * g.n_embd * sizeof(float);
+    if (lrole == gl::kBack) {
+        // the two-box split's back: the residual comes over the link (the front ran the embedding and its layers)
+        if (!gl::recv_hop(p, 1, F->hop_h, link_b, err)) return false;
+        cudaMemcpyAsync(state_, F->hop_h, link_b, cudaMemcpyHostToDevice, F->cs);
+        if (!fast_layers(p, true, err)) return false;
+    } else {
     // ---- the embedding row (host-dequantized from the shard mapping) -> the 4 streams
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
@@ -6013,6 +6023,21 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
+    }
+    if (lrole == gl::kFront) {
+        // the two-box split's front: the residual goes over the link once it is on the host, the back's token comes back
+        cudaMemcpyAsync(F->hop_h, state_, link_b, cudaMemcpyDeviceToHost, F->cs);
+        cudaEventRecord(F->ev_done, F->cs);
+        cudaError_t dn;
+        while ((dn = cudaEventQuery(F->ev_done)) == cudaErrorNotReady) std::this_thread::yield();
+        if (!glmfast::cuda_ok(dn, "glm link hop out", err) || !F->route_ok(err)) return false;
+        if (!gl::send_hop(p, 1, F->hop_h, link_b, err)) return false;
+        int32_t tk = -1;
+        if (!gl::recv_tok(gl::kTok, p, tk, err)) return false;
+        last_tok_ = tk;
+        if (F->prof_on) F->collect();
+        return true;
+    }
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
     Glm5Model* tail = this;
@@ -6084,6 +6109,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     if (gf::launch_errors() > 0) {
         err = "glm fast: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+        return false;
+    }
+    if (lrole == gl::kBack && !gl::send_tok(gl::kTok, p, FT->tok_h[0])) {
+        err = "glm link: down";
         return false;
     }
     last_tok_ = FT->tok_h[0];
@@ -7725,9 +7754,16 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
     FastState* F = fast_;
     for (int32_t t : tokens) {
         const auto t0 = std::chrono::steady_clock::now();
-        if (!fast_token(t, err)) return false;
+        if (!fast_token(t, err)) {
+            if (strata::core::glmlink::role() == strata::core::glmlink::kBack) strata::core::glmlink::abort_link(err);   // (the front waits for this token)
+            return false;
+        }
         F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++F->tokens;
+    }
+    if (host_logits_ && strata::core::glmlink::role() == strata::core::glmlink::kFront) {   // (the logits are the back's)
+        logits_out.assign((size_t) g_.n_vocab, 0.0f);
+        return true;
     }
     if (host_logits_) {
         Glm5Model* tail = this;

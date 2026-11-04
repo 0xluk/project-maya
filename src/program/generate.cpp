@@ -14,6 +14,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "strata/core/glm_link.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/platform/idle_gate.hpp"
@@ -1161,7 +1162,8 @@ static int glm_pack_generate(const Options& o) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
-        std::FILE* f = std::fopen(path.c_str(), "wb");
+        // (the two-box split: the back writes the logits; the front's would be zeros)
+        std::FILE* f = std::fopen(strata::core::glmlink::role() == strata::core::glmlink::kFront ? "/dev/null" : path.c_str(), "wb");
         if (f == nullptr) {
             std::fprintf(stderr, "maya generate: cannot write %s\n", path.c_str());
             return 1;
@@ -1226,7 +1228,7 @@ static int glm_pack_generate(const Options& o) {
 #if defined(_WIN32)
                     const int n = _read(0, chunk, (unsigned) sizeof chunk);
 #else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    const ssize_t n = ::read(strata::core::glmlink::ctl_fd() >= 0 ? strata::core::glmlink::ctl_fd() : 0, chunk, sizeof chunk)   /* two-box back: the link */;
                     if (n < 0 && errno == EINTR) continue;
 #endif
                     if (n <= 0) {
@@ -1241,6 +1243,13 @@ static int glm_pack_generate(const Options& o) {
             while (getline_fd(l)) {
                 strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
+                // the two-box split's front: every line the back must act on in step goes to it too (not STOP, PAUSE
+                // and WRAP - they land at a different token on each side; Phase 1 does not support them)
+                if (strata::core::glmlink::role() == strata::core::glmlink::kFront && l.rfind("STOP", 0) != 0 && l.rfind("PAUSE", 0) != 0 &&
+                    l != "WRAP")
+                    strata::core::glmlink::ctl_send_line(l);
+                if (strata::core::glmlink::role() == strata::core::glmlink::kBack && (l.rfind("STOP", 0) == 0 || l.rfind("PAUSE", 0) == 0 || l == "WRAP"))
+                    continue;
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
                     std::istringstream ls(l);
@@ -1276,6 +1285,7 @@ static int glm_pack_generate(const Options& o) {
                 in_lines.push_back(l);
                 in_cv.notify_one();
             }
+            strata::core::glmlink::ctl_close();   // (the two-box split's front: the back sees the end of its input too)
             std::lock_guard<std::mutex> lk(in_mu);
             in_eof = true;
             in_cv.notify_one();
@@ -1437,6 +1447,8 @@ static int glm_pack_generate(const Options& o) {
     if (slot_max > 0 && !slot_ram) {
         slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
                                                  : std::filesystem::path(o.glm_pack) / "slots";
+        if (strata::core::glmlink::role() != strata::core::glmlink::kNone)   // (two processes on one pack: one directory each)
+            slot_dir += std::string("-") + strata::core::glmlink::role_name();
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
         struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; uint64_t img; };
@@ -4585,6 +4597,8 @@ int main(int argc, char** argv) {
         else if (a == "--stop-eos") { o.stop_eos = true; o.eos_given = true; }
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+        else if (a == "--role") set_env("STRATA_GLM_ROLE", next("--role"));   // the two-box split (glm_link.hpp)
+        else if (a == "--link") set_env("STRATA_GLM_LINK", next("--link"));
         else if (a == "--dflash") o.dflash = next("--dflash");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");

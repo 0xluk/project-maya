@@ -16,6 +16,7 @@
 // rounding (FP16 activations instead of q8_1), as between llama.cpp's batched and one-token paths.  The prompt's
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
+#include "strata/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 
 #include "strata/core/exl3_mma_rows.hpp"
@@ -4211,7 +4212,7 @@ int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice 
         if (m->pf_ == nullptr) return 0;
         Tmax = std::min(Tmax, m->pf_->T);
     }
-    return strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
+    return strata::core::prefill_chunk_len(nn, Tmax, (split_next_ != nullptr || strata::core::glmlink::role() != strata::core::glmlink::kNone), prefill_floor(nn, 1));
 }
 
 // The fewest chunks a split cuts a call of nn tokens into: the call's own floor (prefill_min_chunks, none under 256
@@ -4225,7 +4226,7 @@ int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
                                  "%d tokens (MAYA_GLM_PREFILL_MIN_CHUNKS), so the parts pipeline it\n", s.n, s.min_tokens);
         return s;
     }();
-    if (split_next_ == nullptr) return 1;
+    if (split_next_ == nullptr && strata::core::glmlink::role() == strata::core::glmlink::kNone) return 1;
     return std::max(strata::core::prefill_floor_chunks(nn, call_min, 256),
                     strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
 }
@@ -4253,7 +4254,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)
     const int Trun_max = prefill_force_chunk > 0
                           ? std::min(Tmax, prefill_force_chunk)
-                          : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                          : strata::core::prefill_chunk_len(nn, Tmax, (split_next_ != nullptr || strata::core::glmlink::role() != strata::core::glmlink::kNone),
                                                             prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
@@ -4307,6 +4308,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             ok = false;
         }
     }
+    // the two-box split's back: a failed prompt ends the link (the front is still sending its rows)
+    if (!ok && strata::core::glmlink::role() == strata::core::glmlink::kBack && err != "cancelled") strata::core::glmlink::abort_link(err);
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_floor_ = 0;
@@ -4488,8 +4491,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
               std::to_string(max_ctx_) + ")";
         return false;
     }
+    namespace gl = strata::core::glmlink;
+    const gl::Role lrole = gl::role();
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-    if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
+    if (lrole != gl::kBack && (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr)) {
         err = "glm prefill: no embedding dequantizer";
         return false;
     }
@@ -4529,6 +4534,28 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
         gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+        return true;
+    };
+    // the two-box split's back: chunk c's residual rows from the link (the front's embedding and layers) into R
+    const auto link_in = [&](int c) -> bool {
+        static float* rx = nullptr;   // (one model per process with a role)
+        static size_t rx_cap = 0;
+        const int T = chunk_len(c);
+        const size_t b = (size_t) T * 4 * E * sizeof(float);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt link in", err)) return false;
+        if (rx_cap < b) {
+            if (rx != nullptr) cudaFreeHost(rx);
+            rx = nullptr;
+            rx_cap = 0;
+            if (cudaHostAlloc((void**) &rx, b, cudaHostAllocDefault) != cudaSuccess) {
+                cudaGetLastError();
+                err = "glm link: the prompt's pinned landing buffer did not allocate";
+                return false;
+            }
+            rx_cap = b;
+        }
+        if (!gl::recv_hop(pos_start + (int64_t) c * Tc, T, rx, b, err)) return false;
+        cudaMemcpyAsync(pf_->R, rx, b, cudaMemcpyHostToDevice, fast_->cs);
         return true;
     };
     std::vector<Glm5Model*> parts;
@@ -4614,7 +4641,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
             cudaSetDevice(dev_);
-            if (!embed(c)) return false;
+            if (lrole == gl::kBack ? !link_in(c) : !embed(c)) return false;
             std::vector<int32_t> nx0;
             std::vector<const float*> im0;
             if (mtp_il_ >= 0) next_of(c, nx0, im0);   // a single device carries the draft block itself
@@ -4624,6 +4651,13 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             pf_->chunk_n = nc;
             if (!prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data(), im0.empty() ? nullptr : im0.data()))
                 return false;
+            if (lrole == gl::kFront) {   // the two-box split's front: the chunk's rows over the link
+                const size_t b = (size_t) T * 4 * E * sizeof(float);
+                cudaMemcpyAsync(pf_->hop_h, pf_->R, b, cudaMemcpyDeviceToHost, fast_->cs);
+                if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt link out", err) ||
+                    !gl::send_hop(p0, T, pf_->hop_h, b, err))
+                    return false;
+            }
             Glm5Model* prev = this;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
