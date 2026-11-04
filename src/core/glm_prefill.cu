@@ -2135,7 +2135,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         std::vector<float> buf((size_t) width);
         cudaMemcpy(buf.data(), rows + (size_t) (row < 0 ? T - 1 : row) * width, (size_t) width * sizeof(float),
                    cudaMemcpyDeviceToHost);
-        if (FILE* f = std::fopen((std::string(cb_dir) + "/" + name + ".f32").c_str(), "wb")) {
+        if (FILE* f = std::fopen((std::string(cb_dir) + "/pf-" + name + ".f32").c_str(), "wb")) {
             std::fwrite(buf.data(), 4, buf.size(), f);
             std::fclose(f);
         }
@@ -4483,6 +4483,17 @@ bool Glm5Model::calc_prefill_ready() {
     return true;
 }
 
+// GLM_CB_DIR (debug): a prompt chunk's whole boundary rows (T x 4 x n_embd fp32) as <dir>/<name>.f32 - the
+// split's hand-over, so the two-box split's front/back and one process's hop can be compared row by row
+static void cb_rows_dump(const std::string& name, const float* host, size_t bytes) {
+    static const char* dir = getenv("GLM_CB_DIR");
+    if (dir == nullptr || !dir[0]) return;
+    if (FILE* f = std::fopen((std::string(dir) + "/" + name + ".f32").c_str(), "wb")) {
+        std::fwrite(host, 1, bytes, f);
+        std::fclose(f);
+    }
+}
+
 bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err) {
     const Glm5Geometry& g = g_;
     const int64_t n = (int64_t) tokens.size();
@@ -4634,6 +4645,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 return false;
             }
         }
+        cb_rows_dump("hopin-" + std::to_string(c), rx + (size_t) (c & 1) * lslot, lchunk_b(c));
         cudaMemcpyAsync(pf_->R, rx + (size_t) (c & 1) * lslot, lchunk_b(c), cudaMemcpyHostToDevice, fast_->cs);
         return true;
     };
@@ -4649,6 +4661,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
         cudaMemcpyAsync(pf_->hop_h + (size_t) (c & 1) * lslot, pf_->R, lchunk_b(c), cudaMemcpyDeviceToHost, fast_->cs);
         if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt link out", err)) return false;
+        cb_rows_dump("hop-" + std::to_string(c), pf_->hop_h + (size_t) (c & 1) * lslot, lchunk_b(c));
         std::lock_guard<std::mutex> lk(lp.mu);
         lp.posted = c + 1;
         lp.cv.notify_all();
@@ -4765,6 +4778,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 }
                 cudaSetDevice(prev->dev_);
                 cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, prev->fast_->cs);
+                if (getenv("GLM_CB_DIR") != nullptr) {   // (debug: the hand-over rows, as the two-box split's front)
+                    cudaStreamSynchronize(prev->fast_->cs);
+                    cb_rows_dump("hop-" + std::to_string(c), SP->hop_h, hop);
+                }
                 cudaEventRecord(SP->ev_hop, prev->fast_->cs);
                 cudaSetDevice(m->dev_);
                 cudaStreamWaitEvent(m->fast_->cs, SP->ev_hop, 0);

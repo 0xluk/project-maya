@@ -712,6 +712,8 @@ public:
     bool spec_ready() const;
     bool decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                      int64_t& produced, std::string& err);
+    bool decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                          int64_t& produced, std::string& err);   // the two-box split's (glm_link.hpp)
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted
     double spec_t_[4] = {0, 0, 0, 0};                      // STRATA_GLM_SPEC_PROF host phases of spec_head/tail
     int64_t spec_n_ = 0;

@@ -164,6 +164,8 @@ bool recv_hop(int64_t, int, void*, size_t, std::string& err) { err = "glm link: 
 bool send_tok(Type, int64_t, int32_t) { return false; }
 void abort_link(const std::string&) {}
 bool recv_tok(Type, int64_t, int32_t&, std::string& err) { err = "glm link: not on Windows"; return false; }
+bool send_pair(Type, int64_t, int32_t, int32_t) { return false; }
+bool recv_pair(Type, int64_t, int32_t&, int32_t&, std::string& err) { err = "glm link: not on Windows"; return false; }
 void ctl_send_line(const std::string&) {}
 void ctl_close() {}
 void report() {}
@@ -341,6 +343,35 @@ bool recv_tok(Type t, int64_t pos, int32_t& tok, std::string& err) {
         return false;
     }
     tok = h.val;
+    s_recv_ms += ms_since(t0);
+    ++s_toks;
+    return true;
+}
+
+bool send_pair(Type t, int64_t pos, int32_t val, int32_t n) {
+    if (!up()) return false;
+    Hdr h{kMagic, (uint32_t) t, pos, n, val, 0};
+    if (!send_msg(h, nullptr, 0)) {
+        std::string err;
+        fail(err, "message send failed");
+        return false;
+    }
+    ++s_toks;
+    return true;
+}
+
+bool recv_pair(Type t, int64_t pos, int32_t& val, int32_t& n, std::string& err) {
+    if (!up()) { err = "glm link: down"; return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    Hdr h{};
+    if (!recv_hdr(h, t, err)) return false;
+    if (h.pos != pos) {
+        fail(err, "message " + std::to_string(t) + " for position " + std::to_string((long long) h.pos) + ", expected " +
+                      std::to_string((long long) pos) + " (out of step)");
+        return false;
+    }
+    val = h.val;
+    n = h.n;
     s_recv_ms += ms_since(t0);
     ++s_toks;
     return true;

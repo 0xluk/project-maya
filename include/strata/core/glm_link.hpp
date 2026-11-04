@@ -22,7 +22,9 @@
 namespace strata::core::glmlink {
 
 enum Role : int { kNone = 0, kFront = 1, kBack = 2 };
-enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5 };
+enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7 };
+// kSpec (back -> front, the pipelined spec decode): pos = the tail's position, val = its token y, n = the draft d for
+// the position after (-1: none).  kCtl (front -> back): pos = the position the step is for, val = 1 go on / 0 the end
 
 struct Hdr {
     uint32_t magic;   // kMagic
@@ -51,6 +53,8 @@ bool send_tok(Type t, int64_t pos, int32_t tok);
 // the back failed a request: tell the front why (an ERR in place of what it waits for) and take the link down
 void abort_link(const std::string& why);
 bool recv_tok(Type t, int64_t pos, int32_t& tok, std::string& err);
+bool send_pair(Type t, int64_t pos, int32_t val, int32_t n);                          // kSpec / kCtl
+bool recv_pair(Type t, int64_t pos, int32_t& val, int32_t& n, std::string& err);
 
 // control channel: the front sends each line it reads; the back reads them as its stdin (ctl_fd: -1 off)
 void ctl_send_line(const std::string& line);

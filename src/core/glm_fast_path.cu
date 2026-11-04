@@ -6556,6 +6556,9 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
+    if (strata::core::glmlink::role() != strata::core::glmlink::kNone)   // the two-box split (decode_spec_link)
+        return fast_ != nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr &&
+               (strata::core::glmlink::role() == strata::core::glmlink::kFront || mtp_il_ >= 0);
     if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -6823,6 +6826,8 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
 
 bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                             int64_t& produced, std::string& err) {
+    if (strata::core::glmlink::role() != strata::core::glmlink::kNone && spec_ready())
+        return decode_spec_link(sp, max_new, emit, produced, err);
     produced = 0;
     if (!spec_ready()) {
         err = "glm spec: needs a split with the NextN block";
@@ -7078,6 +7083,177 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     }
     if (ok && !check()) ok = false;
     return ok;
+}
+
+// THE TWO-BOX SPLIT's pipelined speculative decode (glm_link.hpp): decode_spec with the head group on the front box and
+// the tail group (the NextN block, the logits, the sampler) on the back.  Both processes run it in lock step:
+//   back:  the tail's token y for position qp and the draft d for the one after -> kSpec{qp, y, d}
+//   front: both take y (forced, the sampler's counter) and emit it; the front's verdict -> kCtl{qp, go on}
+//   front: the head's rows for qp+1 (a confirmed token's) and qp+2 (the draft's, speculative) over the link; a wrong
+//          draft: the head's recurrent states restored and qp+1 redone - its rows again; the back's tail reads the last
+//          rows sent for its position
+// The front decides when the decode ends; a back whose own emit disagrees says so and follows.
+bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max_new,
+                                 const std::function<bool(int)>& emit, int64_t& produced, std::string& err) {
+    namespace gl = strata::core::glmlink;
+    const bool front = gl::role() == gl::kFront;
+    produced = 0;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const size_t hop_b = (size_t) g.hc * g.n_embd * sizeof(float);
+    cudaSetDevice(dev_);
+    if (spec_hop_h_[0] == nullptr)
+        for (int i = 0; i < 2; ++i)
+            if (cudaHostAlloc((void**) &spec_hop_h_[i], hop_b, cudaHostAllocPortable) != cudaSuccess ||
+                cudaEventCreateWithFlags(&spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                err = "glm spec: the hop slots did not allocate";
+                return false;
+            }
+    const auto fail = [&]() -> bool {   // either side's failure ends the link (the other one waits on it)
+        gl::abort_link(err.empty() ? "the spec decode failed" : err);
+        return false;
+    };
+    // front: the head's rows for p (spec_head left them in slot p & 1) over the link
+    const auto send_rows = [&](int64_t p) -> bool {
+        const int sl = (int) (p & 1);
+        cudaError_t dn;
+        while ((dn = cudaEventQuery(spec_ev_hop_[sl])) == cudaErrorNotReady) std::this_thread::yield();
+        if (!glmfast::cuda_ok(dn, "glm link spec hop out", err) || !F->route_ok(err)) return false;
+        return gl::send_hop(p, 1, spec_hop_h_[sl], hop_b, err);
+    };
+    // back: the tail for p from the last of k row sets the front sends for it
+    const auto tail_at = [&](int64_t p, int k) -> bool {
+        const int sl = (int) (p & 1);
+        for (int i = 0; i < k; ++i)
+            if (!gl::recv_hop(p, 1, spec_hop_h_[sl], hop_b, err)) return false;
+        cudaEventRecord(spec_ev_hop_[sl], F->cs);
+        return spec_tail(this, p, err);
+    };
+    // one token (the tail's for position qp): the back picks it and drafts the next, both take it and emit it, the
+    // front's verdict (more) goes to the back
+    const auto step = [&](int64_t qp, bool first, int& y, int& d, bool& more) -> bool {
+        if (!front) {
+            int raw = -1;
+            if (first && sp.greedy && sp.penalty_last_n <= 0 && last_tok_ >= 0) {
+                raw = last_tok_;
+            } else {
+                if (first) cudaEventRecord(F->ev_done, F->cs);
+                if (sp.greedy && sp.penalty_last_n <= 0) {
+                    if (!glmfast::wait_event(F->ev_done, "glm spec token", err)) return false;
+                    raw = F->tok_h[0];
+                } else if ((raw = fast_sample(sp, err)) < 0) {
+                    return false;
+                }
+                if (!F->route_ok(err)) return false;
+            }
+            y = forced(raw);
+            d = -1;
+            if (qp + 2 < max_ctx_) {   // the draft for qp + 2, from (h_qp, y)
+                if (!fast_mtp(qp, y, err)) return false;
+                if (!glmfast::wait_event(F->ev_mtp, "glm spec draft", err) || !F->route_ok(err)) return false;
+                d = F->mtp_tok_h[0];
+            }
+            if (!gl::send_pair(gl::kSpec, qp, y, d)) {
+                err = "glm link: down";
+                return false;
+            }
+        } else {
+            int yy = -1, dd = -1;
+            if (!gl::recv_pair(gl::kSpec, qp, yy, dd, err)) return false;
+            y = forced(yy);
+            d = dd;
+            if (y != yy) {
+                err = "glm link: the front forces token " + std::to_string(y) + ", the back took " + std::to_string(yy);
+                return false;
+            }
+        }
+        sp.counter += 1;
+        last_tok_ = y;
+        ++produced;
+        const bool e = emit(y);
+        if (front) {
+            more = e && produced < max_new && qp + 2 < max_ctx_ && d >= 0;
+            if (!gl::send_pair(gl::kCtl, qp, more ? 1 : 0, 0)) {
+                err = "glm link: down";
+                return false;
+            }
+        } else {
+            int v = 0, unused = 0;
+            if (!gl::recv_pair(gl::kCtl, qp, v, unused, err)) return false;
+            more = v != 0;
+            if (more != (e && produced < max_new && qp + 2 < max_ctx_))
+                std::fprintf(stderr, "glm link: the back's emit disagrees at position %lld (the front's verdict holds)\n",
+                             (long long) qp);
+        }
+        return true;
+    };
+    int64_t q = pos_ - 1;   // the prompt's last position: both halves done, its logits on the back
+    int y = -1, d = -1;
+    bool more = false;
+    if (!step(q, true, y, d, more)) return fail();
+    if (!more) return true;
+    if (front) {
+        if (!spec_head(q + 1, y, err) || !send_rows(q + 1)) return fail();
+        if (!spec_kda_copy(false)) {
+            err = "glm spec: the recurrent-state backup did not allocate";
+            return fail();
+        }
+        if (!spec_head(q + 2, d, err) || !send_rows(q + 2)) return fail();
+    } else if (!tail_at(q + 1, 1)) {
+        return fail();
+    }
+    bool ok = true;
+    for (;;) {
+        int y2 = -1, d2 = -1;
+        if (!step(q + 1, false, y2, d2, more)) {
+            ok = false;
+            break;
+        }
+        if (!more) {   // the head's speculative rows for q+2 are on their way: the back reads them away
+            if (!front && !gl::recv_hop(q + 2, 1, spec_hop_h_[(q + 2) & 1], hop_b, err)) ok = false;
+            break;
+        }
+        const bool wrong = d != y2;
+        ++spec_steps_;
+        if (!wrong) ++spec_hits_;
+        if (front) {
+            if (wrong) {
+                spec_kda_copy(true);
+                if (!spec_head(q + 2, y2, err) || !send_rows(q + 2)) {
+                    ok = false;
+                    break;
+                }
+            }
+            spec_kda_copy(false);
+            if (!spec_head(q + 3, d2, err) || !send_rows(q + 3)) {
+                ok = false;
+                break;
+            }
+        } else if (!tail_at(q + 2, wrong ? 2 : 1)) {
+            ok = false;
+            break;
+        }
+        if (gf::launch_errors() > 0) {
+            err = "glm spec: a kernel launch failed (see stderr)";
+            ok = false;
+            break;
+        }
+        ++q;
+        d = d2;
+    }
+    std::string drain_err;
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec drain", drain_err) || !F->route_ok(drain_err)) {
+        if (ok) err = drain_err;
+        ok = false;
+    }
+    // both stand at the tail's position (q + 2); the head's recurrent states back to it (the backup after q+1)
+    if (front) {
+        pos_ = q + 2;
+        if (ok && !spec_kda_copy(true)) ok = false;
+    }
+    if (!ok) return fail();
+    return true;
 }
 
 // ---------------------------------------------------------------- conversation reuse
