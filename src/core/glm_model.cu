@@ -1077,7 +1077,10 @@ int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err
         return strata::core::glmlink::recv_tok(strata::core::glmlink::kSample, pos_, tk, err) ? tk : -1;
     }
     if (strata::core::glmlink::role() == strata::core::glmlink::kBack) {
-        const int tok = fast_ != nullptr ? fast_sample(sp, err) : -1;
+        Glm5Model* tl = this;   // (several local parts: the last one holds the logits)
+        while (tl->split_next_) tl = tl->split_next_.get();
+        const int tok = tl->fast_ != nullptr ? tl->fast_sample(sp, err) : -1;
+        cudaSetDevice(dev_);
         if (tok < 0) strata::core::glmlink::abort_link(err.empty() ? "the sampler failed" : err);
         else if (!strata::core::glmlink::send_tok(strata::core::glmlink::kSample, pos_, tok)) {
             err = "glm link: down";
@@ -1244,7 +1247,7 @@ bool Glm5Model::head_split_link(Glm5Model* helper, std::string& err) {
 }
 
 bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
-                                const std::vector<int>& devs, std::string& err) {
+                                const std::vector<int>& devs, std::string& err, int first, int last) {
     const int n = (int) devs.size();
     if (n < 2 || n > kMaxParts || (int) bounds.size() != n - 1) {
         err = "glm split: " + std::to_string(n) + " devices need " + std::to_string(std::max(0, n - 1)) +
@@ -1275,7 +1278,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         std::vector<char> ok((size_t) n, 0);
         std::vector<std::thread> th;
         for (int i = 0; i < n; ++i) {
-            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+            const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
             Glm5Model* p = parts[(size_t) i];
             p->n_parts_ = n;
             p->part_ = i;
@@ -1311,8 +1314,8 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
                 split_next_.reset();
                 return false;
             }
-            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
-            where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
+            const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
+            where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(l1 > 0 ? l1 : g_.n_layers) +
                      ") on CUDA" + std::to_string(devs[(size_t) i]);
         }
         ram_left_check();
@@ -1320,7 +1323,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
     Glm5Model* prev = nullptr;
     Glm5Model* m = this;
     for (int i = 0; i < n; ++i) {
-        const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+        const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
         if (prev != nullptr) {
             prev->split_next_.reset(new Glm5Model());
             m = prev->split_next_.get();
@@ -1335,7 +1338,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             if (prev != nullptr) prev->split_next_.reset();
             return false;
         }
-        where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
+        where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(l1 > 0 ? l1 : g_.n_layers) +
                  ") on CUDA" + std::to_string(devs[(size_t) i]);
         prev = m;
     }
@@ -1979,26 +1982,68 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // the two-box split (strata/core/glm_link.hpp, --role front|back): this process loads ONE part of a two-part split
     // at layer K on its first visible GPU, and the link carries the boundary
     if (strata::core::glmlink::role() != strata::core::glmlink::kNone) {
-        const int K = std::atoi(spec.c_str());
-        if (spec.empty() || spec.find_first_not_of("0123456789") != std::string::npos || K < 1) {
-            err = "glm link: --role needs --layer-split K (the back's first layer)";
+        // --layer-split K: one part on the first visible GPU; K:b1,b2,..: this side's layers over several local GPUs
+        // (b = the first layer of each later local part - the front's lie below K, the back's above), each local
+        // boundary an ordinary in-process hop, the link between the front's last part and the back's first
+        const size_t colon = spec.find(':');
+        const std::string ks = spec.substr(0, colon);
+        const int K = std::atoi(ks.c_str());
+        if (ks.empty() || ks.find_first_not_of("0123456789") != std::string::npos || K < 1) {
+            err = "glm link: --role needs --layer-split K or K:b1,b2,.. (K the back's first layer)";
             return false;
         }
         const bool front = strata::core::glmlink::role() == strata::core::glmlink::kFront;
-        n_parts_ = 2;
-        part_ = front ? 0 : 1;
-        if (!load_pack(pack_dir, max_ctx, err, 0, front ? 0 : K, front ? K : 0)) return false;
+        strata::core::glmlink::set_split(K);
+        std::vector<int> lb;
+        if (colon != std::string::npos) {
+            std::stringstream ss(spec.substr(colon + 1));
+            std::string t;
+            while (std::getline(ss, t, ','))
+                if (t.empty() || t.find_first_not_of("0123456789 ") != std::string::npos) {
+                    err = "glm link: not a layer list after K: " + spec;
+                    return false;
+                } else {
+                    lb.push_back(std::atoi(t.c_str()));
+                }
+        }
+        bool ok = true;
+        for (size_t i = 0; ok && i < lb.size(); ++i)
+            ok = (front ? lb[i] >= 1 && lb[i] < K : lb[i] > K && lb[i] < g_.n_layers) && (i == 0 || lb[i] > lb[i - 1]);
+        if (!ok) {
+            err = "glm link: the local boundaries must rise inside this side's layers (" + spec + ")";
+            return false;
+        }
+        if (lb.empty()) {
+            n_parts_ = 2;
+            part_ = front ? 0 : 1;
+            if (!load_pack(pack_dir, max_ctx, err, 0, front ? 0 : K, front ? K : 0)) return false;
+        } else {
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+            cudaGetLastError();
+            std::vector<int> devs;
+            for (int i = 0; i <= (int) lb.size(); ++i) devs.push_back(i);
+            if (n_dev < (int) devs.size()) {
+                err = "glm link: " + std::to_string(devs.size()) + " local parts need as many visible GPUs (" +
+                      std::to_string(n_dev) + ")";
+                return false;
+            }
+            if (!load_pack_split(pack_dir, max_ctx, lb, devs, err, front ? 0 : K, front ? K : 0)) return false;
+        }
         // both sides cut every prompt into the same chunks: the smaller side's chunk (none if either has none)
         int peer = 0;
         if (!strata::core::glmlink::open(K, max_ctx, prefill_chunk(), peer, err)) return false;
-        if (peer <= 0 || prefill_chunk() <= 0) {
-            if (pf_ != nullptr) prefill_destroy();
-        } else if (peer < prefill_chunk()) {
-            prefill_cap(peer, "the other box's");
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (peer <= 0 || prefill_chunk() <= 0) {
+                if (m->pf_ != nullptr) m->prefill_destroy();
+            } else if (peer < m->prefill_chunk()) {
+                m->prefill_cap(peer, "the other box's");
+            }
         }
         cudaSetDevice(dev_);
-        std::fprintf(stderr, "glm split: layers [%d, %d) on CUDA%d, the %s of a two-box split over the link\n", l0_,
-                     l1_, dev_, strata::core::glmlink::role_name());
+        std::fprintf(stderr, "glm split: layers [%d, %d) on %d local GPU(s), the %s of a two-box split over the link\n",
+                     front ? 0 : K, front ? K : g_.n_layers, (int) lb.size() + 1, strata::core::glmlink::role_name());
         return true;
     }
     // STRATA_GLM_EXPERT_HELPER=<device>: the expert helper - alone beside one trunk GPU (no split: dense, state and

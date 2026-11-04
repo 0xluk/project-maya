@@ -4511,7 +4511,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     }
     const auto t0 = std::chrono::steady_clock::now();
     const int E = g.n_embd;
-    const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
+    // (the two-box back's first part has no embedding - and, with several local parts, no token_embd type at all)
+    const size_t row_b = lrole == gl::kBack ? 0 : ggml_row_size((ggml_type) pack_emb_type_, E);
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
     const int64_t pos_start = pos_;
@@ -4561,6 +4562,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::thread th;
     } lp;
     const size_t lslot = (size_t) Tc * 4 * E;   // floats
+    Glm5Model* ltail = this;   // the front's last local part: its rows cross the link (its hop slots are free)
+    while (ltail->split_next_) ltail = ltail->split_next_.get();
     static float* rx = nullptr;                 // the back's landing slots (one model per process with a role)
     static size_t rx_cap = 0;
     const auto lchunk_b = [&](int c) { return (size_t) chunk_len(c) * 4 * E * sizeof(float); };
@@ -4609,7 +4612,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     if (lp.posted <= c) return;
                 }
                 std::string e;
-                if (!gl::send_hop(lp0(c), chunk_len(c), pf_->hop_h + (size_t) (c & 1) * lslot, lchunk_b(c), e)) {
+                if (!gl::send_hop(lp0(c), chunk_len(c), ltail->pf_->hop_h + (size_t) (c & 1) * lslot, lchunk_b(c), e)) {
                     lfail(e);
                     return;
                 }
@@ -4649,19 +4652,22 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         cudaMemcpyAsync(pf_->R, rx + (size_t) (c & 1) * lslot, lchunk_b(c), cudaMemcpyHostToDevice, fast_->cs);
         return true;
     };
-    // the front: chunk c's rows into its slot (once chunk c - 2 has gone out of it), for the thread to send
-    const auto link_out = [&](int c) -> bool {
+    // the front: chunk c's rows (the last local part's) into its slot (once chunk c - 2 has gone out of it), for the
+    // thread to send.  e: the error (the pipeline calls it from the last part's thread)
+    const auto link_out = [&](int c, std::string& e) -> bool {
         {
             std::unique_lock<std::mutex> lk(lp.mu);
             lp.cv.wait(lk, [&] { return lp.done >= c - 1 || lp.bad; });
             if (lp.bad) {
-                err = lp.err;
+                e = lp.err;
                 return false;
             }
         }
-        cudaMemcpyAsync(pf_->hop_h + (size_t) (c & 1) * lslot, pf_->R, lchunk_b(c), cudaMemcpyDeviceToHost, fast_->cs);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt link out", err)) return false;
-        cb_rows_dump("hop-" + std::to_string(c), pf_->hop_h + (size_t) (c & 1) * lslot, lchunk_b(c));
+        cudaSetDevice(ltail->dev_);
+        cudaMemcpyAsync(ltail->pf_->hop_h + (size_t) (c & 1) * lslot, ltail->pf_->R, lchunk_b(c), cudaMemcpyDeviceToHost,
+                        ltail->fast_->cs);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(ltail->fast_->cs), "glm prompt link out", e)) return false;
+        cb_rows_dump("hop-" + std::to_string(c), ltail->pf_->hop_h + (size_t) (c & 1) * lslot, lchunk_b(c));
         std::lock_guard<std::mutex> lk(lp.mu);
         lp.posted = c + 1;
         lp.cv.notify_all();
@@ -4760,7 +4766,6 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             pf_->chunk_n = nc;
             if (!prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data(), im0.empty() ? nullptr : im0.data()))
                 return false;
-            if (lrole == gl::kFront && !link_out(c)) return false;   // the two-box split: over the link
             Glm5Model* prev = this;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
@@ -4802,6 +4807,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 prev = m;
             }
             if (cancelled) break;
+            if (lrole == gl::kFront && !link_out(c, err)) return false;   // the two-box split: over the link
+            cudaSetDevice(dev_);
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
             ++pf_->chunks;
@@ -4911,6 +4918,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         read_done();
                         continue;
                     }
+                    if (lrole == gl::kFront && !link_out(c, e2)) {   // the two-box split: the front's last part
+                        fail(e2.empty() ? "glm link: the prompt's rows did not go out" : e2);
+                        return;
+                    }
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt pipeline", e2)) {
                         fail(e2);
                         return;
@@ -4931,7 +4942,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             }
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
-            if (!embed(c)) { fail(err); break; }
+            if (lrole == gl::kBack ? !link_in(c) : !embed(c)) { fail(err); break; }
             std::string e1;
             pf_->chunk_i = c + 1;
             pf_->chunk_n = nc;
@@ -4964,6 +4975,14 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             }
         }
         for (auto& t : later) t.join();
+        if (lrole == gl::kFront && !stop) {   // the two-box split: the last chunks out before the decode
+            std::unique_lock<std::mutex> lk(lp.mu);
+            lp.cv.wait(lk, [&] { return lp.done >= nc || lp.bad; });
+            if (lp.done < nc) {
+                stop = true;
+                stage_err = lp.err.empty() ? "glm link: the prompt's rows did not go out" : lp.err;
+            }
+        }
         if (stop) {
             if (stage_err == "cancelled") {
                 cancelled = true;

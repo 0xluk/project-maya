@@ -313,6 +313,9 @@ static bool link_hostport(std::string& host, std::string& port, std::string& err
     return true;
 }
 
+void set_split(int split_at) { g_split = split_at; }
+int split_at() { return g_split; }
+
 bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::string& err) {
     std::string host, port;
     if (!link_hostport(host, port, err)) return false;
