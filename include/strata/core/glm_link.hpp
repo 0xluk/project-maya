@@ -18,6 +18,11 @@
 // and kEnd/kAck (the front's end: the back stops wherever it waits - kEnd in place of any message is a cancel - and
 // acknowledges with its position; anything stale before the marker is dropped).
 // STRATA_GLM_LINK_BF16=1 (default): the boundary rows cross as bf16 (rounded to nearest even, upcast on the back).
+// The back listens on STRATA_GLM_LINK_BIND (else the --link host; an empty host is loopback, never every interface) and
+// accepts a front only from the addresses in STRATA_GLM_LINK_ALLOW / MAYA_GLM_LINK_ALLOW (comma-separated IPv4;
+// unset: loopback only).  Malformed lengths (an ERR over 4 KiB, a payload on a message without one, a packed block
+// that does not fit its own length) are protocol errors: the link drops.
+// Several local GPUs per side: --layer-split K:b1,b2,.. (glm_model.cu load_pack_place).
 #pragma once
 
 #include <cstddef>
