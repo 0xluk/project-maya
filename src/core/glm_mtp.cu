@@ -24,6 +24,7 @@
 // asks for it elsewhere, =0 turns it off.  Not with several conversations at once (--parallel) or a DFlash drafter.
 //
 // The NextN cache's entry p pairs h_p with the token at p + 1 (the prompt path writes them so).
+#include "strata/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -93,7 +94,7 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts) {
 #endif
 }
 
-bool Glm5Model::mtp_ready() const { return fast_ != nullptr && mtp_dec_ && mtp_il_ >= 0 && split_next_ == nullptr; }
+bool Glm5Model::mtp_ready() const { return fast_ != nullptr && mtp_dec_ && mtp_il_ >= 0 && split_next_ == nullptr && strata::core::glmlink::role() == strata::core::glmlink::kNone; }
 
 // ---------------------------------------------------------------- the draft head
 // A draft step ran the whole output head - 154880 x 4096 Q6_K, 0.52 GB, ~2.4 ms of the ~4 ms a step on the Radeon 8065S
