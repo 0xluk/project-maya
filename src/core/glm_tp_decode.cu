@@ -336,6 +336,9 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
     // MAYA_GLM_TP_SPIN=1: the helpers' and the owner's waits spin on host flags; default: CUDA events order them (no
     // kernel ever spins, so nothing can starve or deadlock behind a waiting kernel)
     static const bool spin = getenv("MAYA_GLM_TP_SPIN") != nullptr && std::atoi(getenv("MAYA_GLM_TP_SPIN")) != 0;
+    // the owner's wait for the helpers' rows: spinning on their flags (default; safe - the helpers' work is queued
+    // and only waits for this owner's input, already out) or MAYA_GLM_TP_OWNER_EVENTS=1 (CUDA events, slower)
+    static const bool owner_ev = getenv("MAYA_GLM_TP_OWNER_EVENTS") != nullptr && std::atoi(getenv("MAYA_GLM_TP_OWNER_EVENTS")) != 0;
     k_put<<<kBlocks, kThreads, 0, s>>>((const uint32_t*) xq, words_in, o->bhost, o->bflags, seq);
     if (!spin) cudaEventRecord(o->pub, s);
     // 2. the owner's own rows (and its other jobs) in one launch
@@ -377,13 +380,13 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
         }
         if (!gf::mv(HJ, n, H.s)) ok = false;
         k_put<<<kBlocks, kThreads, 0, H.s>>>((const uint32_t*) H.y, off, H.host, H.flags, seq);
-        if (!spin) cudaEventRecord(H.done, H.s);
+        if (!spin && owner_ev) cudaEventRecord(H.done, H.s);
         c.host[h] = H.host;
-        c.flags[h] = spin ? H.flags : nullptr;
+        c.flags[h] = spin || !owner_ev ? H.flags : nullptr;
     }
     gf::set_skip(skip);
     cudaSetDevice(dev);
-    if (!spin)
+    if (!spin && owner_ev)
         for (auto& H : o->helpers) cudaStreamWaitEvent(s, H.done, 0);
     // 4. the owner gathers the helpers' rows
     k_collect<<<dim3(kBlocks, c.nh), kThreads, 0, s>>>(c, seq, err);
