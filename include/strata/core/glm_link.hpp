@@ -49,6 +49,9 @@ bool up();                            // the link is connected and healthy
 // open the link (front: connect, retrying up to STRATA_GLM_LINK_WAIT seconds, default 1800; back: listen, accept both
 // connections) and exchange HELLO.  my_chunk: this side's prompt chunk; peer_chunk: the other side's.
 bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::string& err);
+// the boundary layer K (set at load, before open: the parts size their RAM tiers over this side's layers only)
+void set_split(int split_at);
+int split_at();
 
 // data channel
 bool send_hop(int64_t pos, int n, const void* data, size_t bytes, std::string& err);

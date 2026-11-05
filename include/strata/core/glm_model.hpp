@@ -118,9 +118,10 @@ public:
                        const std::string& layer_split = "");
     bool load_pack_place(const std::string& pack_dir, int64_t max_ctx, std::string& err, const std::string& layer_split);
     /// The explicit split form behind load_pack_env: devs[i] runs layers [bounds[i-1], bounds[i]) (bounds holds
-    /// the first layer of each later part, devs.size() - 1 of them).
+    /// the first layer of each later part, devs.size() - 1 of them).  first/last: the layers the split covers (the
+    /// two-box split's side: [first, last), last 0 = to the end; the whole model by default).
     bool load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
-                         const std::vector<int>& devs, std::string& err);
+                         const std::vector<int>& devs, std::string& err, int first = 0, int last = 0);
     static constexpr int kMaxParts = 16;
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; STRATA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).

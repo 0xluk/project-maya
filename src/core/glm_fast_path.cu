@@ -145,6 +145,9 @@ using glmfast::Workers;
 // TAIL GROUP the rest.  fast_setup asks for h alone: it runs before the parts are linked (split_next_ is set after
 // every part has loaded), so it counts them instead of walking the chain.
 static int spec_head_parts(int n) {
+    // the two-box split: the front's parts are all the head group, the back's all the tail group (decode_spec_link)
+    if (strata::core::glmlink::role() == strata::core::glmlink::kFront) return n;
+    if (strata::core::glmlink::role() == strata::core::glmlink::kBack) return 0;
     int h = n / 2;
     if (const char* e = getenv("STRATA_GLM_SPEC_HEAD")) h = std::atoi(e);
     return std::max(1, std::min(n - 1, h));
@@ -1764,9 +1767,16 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 remaining = total;
                 remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
+                // the two-box split: this side's MoE layers only (the other box has its own RAM)
+                if (const int K = strata::core::glmlink::split_at();
+                    K > 0 && strata::core::glmlink::role() == strata::core::glmlink::kFront)
+                    remaining_layers = std::max(1, K - g.dense_lead);
+                else if (K > 0 && strata::core::glmlink::role() == strata::core::glmlink::kBack)
+                    remaining_layers = g.n_layers - std::max(K, g.dense_lead) + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
-            budget = l1_ >= g.n_layers || strata::core::glmlink::role() != strata::core::glmlink::kNone ? remaining
+            budget = l1_ >= g.n_layers || (strata::core::glmlink::role() == strata::core::glmlink::kFront &&
+                                           l1_ >= strata::core::glmlink::split_at()) ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
             // a later part: no more than is free now, less what is still to come and half the headroom (a parallel
@@ -6325,20 +6335,6 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
     }
-    if (lrole == gl::kFront) {
-        // the two-box split's front: the residual goes over the link once it is on the host, the back's token comes back
-        cudaMemcpyAsync(F->hop_h, state_, link_b, cudaMemcpyDeviceToHost, F->cs);
-        cudaEventRecord(F->ev_done, F->cs);
-        cudaError_t dn;
-        while ((dn = cudaEventQuery(F->ev_done)) == cudaErrorNotReady) std::this_thread::yield();
-        if (!glmfast::cuda_ok(dn, "glm link hop out", err) || !F->route_ok(err)) return false;
-        if (!gl::send_hop(p, 1, F->hop_h, link_b, err)) return false;
-        int32_t tk = -1;
-        if (!gl::recv_tok(gl::kTok, p, tk, err)) return false;
-        last_tok_ = tk;
-        if (F->prof_on) F->collect();
-        return true;
-    }
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
     Glm5Model* tail = this;
@@ -6358,6 +6354,28 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
+    if (lrole == gl::kFront) {
+        // the two-box split's front: the residual goes over the link once it is on the host (from the front's last
+        // local part), the back's token comes back
+        cudaMemcpyAsync(FT->hop_h, tail->state_, link_b, cudaMemcpyDeviceToHost, FT->cs);
+        cudaEventRecord(FT->ev_done, FT->cs);
+        cudaError_t dn;
+        while ((dn = cudaEventQuery(FT->ev_done)) == cudaErrorNotReady) std::this_thread::yield();
+        if (!glmfast::cuda_ok(dn, "glm link hop out", err)) return false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (!m->fast_->route_ok(err)) return false;
+        if (!gl::send_hop(p, 1, FT->hop_h, link_b, err)) return false;
+        int32_t tk = -1;
+        if (!gl::recv_tok(gl::kTok, p, tk, err)) return false;
+        last_tok_ = tk;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->fast_ && m->fast_->prof_on) {
+                cudaSetDevice(m->dev_);
+                m->fast_->collect();
+            }
+        cudaSetDevice(dev_);
+        return true;
+    }
     gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
                   FT->cs);
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
@@ -6862,9 +6880,15 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
-    if (strata::core::glmlink::role() != strata::core::glmlink::kNone)   // the two-box split (decode_spec_link)
-        return fast_ != nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr &&
-               (strata::core::glmlink::role() == strata::core::glmlink::kFront || mtp_il_ >= 0);
+    if (strata::core::glmlink::role() != strata::core::glmlink::kNone) {   // the two-box split (decode_spec_link)
+        if (getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
+        const Glm5Model* tl = this;   // (several local parts: every one fast, the back's last with the NextN block)
+        for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            if (m->fast_ == nullptr) return false;
+            tl = m;
+        }
+        return strata::core::glmlink::role() == strata::core::glmlink::kFront || tl->mtp_il_ >= 0;
+    }
     if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -7460,15 +7484,39 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const size_t hop_b = (size_t) g.hc * g.n_embd * sizeof(float);
-    cudaSetDevice(dev_);
-    if (spec_hop_h_[0] == nullptr)
+    // several local parts per side: the front's are the head group (its last part, hl, holds the rows that cross), the
+    // back's the tail group (its last part, TL, the logits, the sampler and the NextN block)
+    Glm5Model* hl = front ? spec_head_last() : this;
+    Glm5Model* TL = spec_tail_last();
+    FastState* FT = TL->fast_;
+    // every head part's hop slots (spec_head hands the rows down the front's parts through their own double-buffered
+    // slots; hl's are the ones that cross), the back's own (tail_at receives into them)
+    for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
+        if (m->spec_hop_h_[0] != nullptr) continue;
+        cudaSetDevice(m->dev_);
         for (int i = 0; i < 2; ++i)
-            if (cudaHostAlloc((void**) &spec_hop_h_[i], hop_b, cudaHostAllocPortable) != cudaSuccess ||
-                cudaEventCreateWithFlags(&spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &m->spec_hop_h_[i], hop_b, cudaHostAllocPortable) != cudaSuccess ||
+                cudaEventCreateWithFlags(&m->spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
                 cudaGetLastError();
                 err = "glm spec: the hop slots did not allocate";
                 return false;
             }
+    }
+    cudaSetDevice(dev_);
+    const auto routes_ok = [&]() -> bool {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (!m->fast_->route_ok(err)) return false;
+        return true;
+    };
+    // the head group's recurrent-state backups (each front part on its own device and stream)
+    const auto kda_all = [&](bool restore) -> bool {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!m->spec_kda_copy(restore)) return false;
+        }
+        cudaSetDevice(dev_);
+        return true;
+    };
     const auto fail = [&]() -> bool {   // either side's failure ends the link (the other one waits on it)
         if (gl::cancelled()) return false;   // (the back: the front's kEnd - not a failure, the link stays up)
         gl::abort_link(err.empty() ? "the spec decode failed" : err);
@@ -7478,9 +7526,9 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
     const auto send_rows = [&](int64_t p) -> bool {
         const int sl = (int) (p & 1);
         cudaError_t dn;
-        while ((dn = cudaEventQuery(spec_ev_hop_[sl])) == cudaErrorNotReady) std::this_thread::yield();
-        if (!glmfast::cuda_ok(dn, "glm link spec hop out", err) || !F->route_ok(err)) return false;
-        return gl::send_hop(p, 1, spec_hop_h_[sl], hop_b, err);
+        while ((dn = cudaEventQuery(hl->spec_ev_hop_[sl])) == cudaErrorNotReady) std::this_thread::yield();
+        if (!glmfast::cuda_ok(dn, "glm link spec hop out", err) || !routes_ok()) return false;
+        return gl::send_hop(p, 1, hl->spec_hop_h_[sl], hop_b, err);
     };
     // back: the tail for p from the rows in slot p & 1, after k more row sets for p (the last one stands)
     const auto tail_at = [&](int64_t p, int k) -> bool {
@@ -7498,22 +7546,25 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
             if (first && sp.greedy && sp.penalty_last_n <= 0 && last_tok_ >= 0) {
                 raw = last_tok_;
             } else {
-                if (first) cudaEventRecord(F->ev_done, F->cs);
+                cudaSetDevice(TL->dev_);
+                if (first) cudaEventRecord(FT->ev_done, FT->cs);
                 if (sp.greedy && sp.penalty_last_n <= 0) {
-                    if (!glmfast::wait_event(F->ev_done, "glm spec token", err)) return false;
-                    raw = F->tok_h[0];
-                } else if ((raw = fast_sample(sp, err)) < 0) {
+                    if (!glmfast::wait_event(FT->ev_done, "glm spec token", err)) return false;
+                    raw = FT->tok_h[0];
+                } else if ((raw = TL->fast_sample(sp, err)) < 0) {
                     return false;
                 }
-                if (!F->route_ok(err)) return false;
+                if (!routes_ok()) return false;
             }
             y = forced(raw);
             d = -1;
             if (qp + 2 < max_ctx_) {   // the draft for qp + 2, from (h_qp, y)
-                if (!fast_mtp(qp, y, err)) return false;
-                if (!glmfast::wait_event(F->ev_mtp, "glm spec draft", err) || !F->route_ok(err)) return false;
-                d = F->mtp_tok_h[0];
+                cudaSetDevice(TL->dev_);
+                if (!TL->fast_mtp(qp, y, err)) return false;
+                if (!glmfast::wait_event(FT->ev_mtp, "glm spec draft", err) || !routes_ok()) return false;
+                d = FT->mtp_tok_h[0];
             }
+            cudaSetDevice(dev_);
             if (!gl::send_pair(gl::kSpec, qp, y, d)) {
                 err = "glm link: down";
                 return false;
@@ -7559,7 +7610,7 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
     if (!more) return true;
     if (front) {
         if (!spec_head(q + 1, y, err) || !send_rows(q + 1)) return fail();
-        if (!spec_kda_copy(false)) {
+        if (!kda_all(false)) {
             err = "glm spec: the recurrent-state backup did not allocate";
             return fail();
         }
@@ -7580,13 +7631,13 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
         if (!wrong) ++spec_hits_;
         if (front) {
             if (wrong) {
-                spec_kda_copy(true);
+                kda_all(true);
                 if (!spec_head(q + 2, y2, err) || !send_rows(q + 2)) {
                     ok = false;
                     break;
                 }
             }
-            spec_kda_copy(false);
+            kda_all(false);
             if (!spec_head(q + 3, d2, err) || !send_rows(q + 3)) {
                 ok = false;
                 break;
@@ -7604,14 +7655,20 @@ bool Glm5Model::decode_spec_link(strata::kernels::SamplerParams& sp, int64_t max
         d = d2;
     }
     std::string drain_err;
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec drain", drain_err) || !F->route_ok(drain_err)) {
-        if (ok) err = drain_err;
-        ok = false;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm spec drain", drain_err) ||
+            !m->fast_->route_ok(drain_err)) {
+            if (ok) err = drain_err;
+            ok = false;
+            break;
+        }
     }
+    cudaSetDevice(dev_);
     // both stand at the tail's position (q + 2); the head's recurrent states back to it (the backup after q+1)
     if (front) {
-        pos_ = q + 2;
-        if (ok && !spec_kda_copy(true)) ok = false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pos_ = q + 2;
+        if (ok && !kda_all(true)) ok = false;
     }
     if (!ok) return fail();
     return true;
