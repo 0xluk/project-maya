@@ -142,7 +142,9 @@ size_t reserve_bytes() {
 }
 
 bool active(int dev) {
-    if (g_ctx == nullptr) return false;
+    // MAYA_GLM_TP_DRY=1: everything set up (the same VRAM left to the pool) but nothing split - the A/B twin of TP on
+    static const bool dry = getenv("MAYA_GLM_TP_DRY") != nullptr && std::atoi(getenv("MAYA_GLM_TP_DRY")) != 0;
+    if (g_ctx == nullptr || dry) return false;
     for (auto& o : g_ctx->owners)
         if (o->dev == dev) return true;
     return false;
@@ -301,6 +303,8 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
     const size_t in_bytes = (size_t) (n_in / 32) * 36;   // q8_1
     if (in_bytes > kInMax || in_bytes % 4 != 0) return false;
     const unsigned seq = ++o->seq;
+    if (seq == 1) std::fprintf(stderr, "glm tp: CUDA%d splits its first GEMV group (layer %d)\n", dev, il);
+    if (seq % 100000 == 0 && failed()) std::fprintf(stderr, "glm tp: an exchange timed out - the outputs are wrong\n");
     unsigned* err = g_ctx->err;
     const int words_in = (int) (in_bytes / 4);
     // 1. the owner publishes the q8_1 input
