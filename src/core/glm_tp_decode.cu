@@ -84,6 +84,14 @@ __global__ void k_collect(CollectJobs c, unsigned seq, unsigned* err) {
     }
 }
 
+// MAYA_GLM_TP_CHECK=1: the owner's full GEMV again into chk; words that differ from the split result counted
+__global__ void k_cmp(const uint32_t* a, const uint32_t* b, int n, unsigned* bad, unsigned* checked) {
+    unsigned c = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) c += a[i] != b[i];
+    if (c) atomicAdd(bad, c);
+    if (blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(checked, (unsigned) n);
+}
+
 struct Slice {
     void* w = nullptr;     // on the helper
     int64_t r0 = 0, rows = 0;
@@ -108,6 +116,7 @@ struct Owner {
     unsigned* bflags = nullptr;
     std::vector<Helper> helpers;
     std::map<int, GroupState> groups;   // il * kGroups + grp
+    float* chk = nullptr;                // MAYA_GLM_TP_CHECK
 };
 struct Ctx {
     std::vector<std::unique_ptr<Owner>> owners;
@@ -354,6 +363,28 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
     cudaSetDevice(dev);
     // 4. the owner gathers the helpers' rows
     k_collect<<<dim3(kBlocks, c.nh), kThreads, 0, s>>>(c, seq, err);
+    static const bool check = getenv("MAYA_GLM_TP_CHECK") != nullptr;
+    if (check) {
+        if (o->chk == nullptr) {
+            cudaMalloc(&o->chk, 3 * 16384 * sizeof(float) + 64);
+            cudaMemset(o->chk, 0, 3 * 16384 * sizeof(float) + 64);
+        }
+        unsigned* bad = (unsigned*) (o->chk + 3 * 16384);
+        unsigned* checked = bad + 1;
+        for (int j = 0; j < n; ++j) {
+            gf::MvJob f = split[j];
+            f.y = o->chk;
+            gf::mv(&f, 1, s);
+            k_cmp<<<16, 256, 0, s>>>((const uint32_t*) o->chk, (const uint32_t*) split[j].y, split[j].n_out, bad, checked);
+        }
+        if (seq % 2000 == 0) {
+            unsigned h[2] = {0, 0};
+            cudaMemcpyAsync(h, bad, sizeof(h), cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+            std::fprintf(stderr, "glm tp check: CUDA%d %u of %u output words differ%s\n", dev, h[0], h[1],
+                         failed() ? " (an exchange timed out)" : "");
+        }
+    }
     return true;
 }
 
