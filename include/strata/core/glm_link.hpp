@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace strata::core::glmlink {
@@ -100,6 +101,10 @@ bool reopen(std::string& err);        // the front: connect again (STRATA_GLM_RE
 void wake();                          // the back: the old link's data socket shut (a main thread blocked on it returns)
 bool reaccept(std::string& err);      // the back: accept the front's next connection and HELLO
 uint64_t generation();                // connections made so far (a new front: the old one's requests are gone)
+// several conversations: the front polls for a token while rows still wait to go out; the back, while it waits for
+// a message, sends each token as soon as it is picked (the hook returns false once nothing is left to watch)
+bool readable();                      // a message (or the link's end) is there to read now
+void set_wait_hook(std::function<bool()> hook);
 
 // stats (stderr at exit): hops, bytes, time blocked in send/recv
 void report();

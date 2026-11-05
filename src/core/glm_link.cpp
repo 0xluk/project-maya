@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -32,6 +33,7 @@ namespace {
 int g_data = -1, g_ctl = -1, g_listen = -1;
 std::atomic<bool> g_up{false};
 std::atomic<uint64_t> g_gen{0};   // generation(): connections made
+std::function<bool()> g_wait_hook;   // set_wait_hook
 // what open() was given (reopen / reaccept HELLO with it again)
 int g_split = 0, g_my_chunk = 0, g_peer_chunk = -1;
 int64_t g_ctx = 0;
@@ -374,6 +376,7 @@ Role role() {
 const char* role_name() { return role() == kFront ? "front" : role() == kBack ? "back" : "none"; }
 bool up() { return g_up.load(); }
 uint64_t generation() { return g_gen.load(); }
+void set_wait_hook(std::function<bool()> hook) { g_wait_hook = std::move(hook); }
 int ctl_fd() { return role() == kBack ? g_ctl : -1; }
 
 bool key_ready(std::string& err) {
@@ -407,6 +410,7 @@ bool idle_check() { return false; }
 bool reopen(std::string& err) { err = "glm link: not on Windows"; return false; }
 void wake() {}
 bool reaccept(std::string& err) { err = "glm link: not on Windows"; return false; }
+bool readable() { return false; }
 #else
 // this side's settings both must share: the hop's format and the prompt's chunking floor (the chunks must match)
 static std::string link_config() {
@@ -819,7 +823,16 @@ static bool read_err(const Hdr& h, std::string& why) {
     return true;
 }
 
+bool readable() {
+    if (g_data < 0) return true;
+    struct pollfd pf {g_data, POLLIN, 0};
+    return ::poll(&pf, 1, 0) != 0;
+}
+
 static bool recv_hdr(Hdr& h, uint32_t want, std::string& err) {
+    // (several conversations, the back: its picked tokens go out while it waits - the hook says when none is left)
+    if (g_wait_hook)
+        while (!readable() && g_wait_hook()) std::this_thread::yield();
     if (!read_all(g_data, &h, sizeof h) || h.magic != kMagic) {
         fail(err, "the connection is lost");
         return false;

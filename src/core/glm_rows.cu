@@ -1003,7 +1003,7 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
             SeqCtx& ct = tail->seq_[(size_t) seqs[i]];
             cudaMemcpyAsync(ct.hop_h, cur[i].state, hop, cudaMemcpyDeviceToHost, tail->fast_->cs);
             cudaEventRecord(ct.ev_hop, tail->fast_->cs);
-            link_out_.push_back({seqs[i], p0[i]});
+            link_out_.push_back({(uint32_t) gl::kHop, seqs[i], p0[i], 0, 0});
         }
     } else {
         if (!tail->rows_head(cur, sps, n, err)) return false;
@@ -1016,6 +1016,8 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
     }
     if (lrole != gl::kNone)
         for (int i = 0; i < n; ++i) link_pos_[(size_t) seqs[i]] = p0[i];
+    if (lrole == gl::kBack)   // (their tokens go out as soon as they are picked: link_tok_pump)
+        for (int i = 0; i < n; ++i) link_tok_q_.push_back(seqs[i]);
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         for (int i = 0; i < n; ++i) {
             if (seqs[i] == m->cur_seq_)

@@ -2664,6 +2664,11 @@ static int glm_pack_generate(const Options& o) {
                                  "off over the two-box split\n");
         std::fprintf(stderr, "glm link: %d conversations at once over the link, up to %d rows a group (%s)\n",
                      model.seq_count(), split_rows, gl::role_name());
+        if (lmb)   // the back: its picked tokens go out while it waits for the front's next message
+            gl::set_wait_hook([&model] {
+                std::string e;
+                return model.link_tok_pump(false, e) && !model.link_tok_q_.empty();
+            });
     }
     // STRATA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
     // k at a time (strata/core/split_groups.hpp): k 4 no longer makes one group - and idle GPUs - at 4 requests or fewer
@@ -2872,7 +2877,7 @@ static int glm_pack_generate(const Options& o) {
             const int32_t code = std::strcmp(g.finish, "stop") == 0 ? 1 : std::strcmp(g.finish, "cancel") == 0 ? 2 : 0;
             const int32_t v = (more ? 1 : 0) | (code << 1) | (g.pause ? 8 : 0) | (g.keep ? 16 : 0) | extra;
             std::string le;
-            if (model.link_flush(le)) gl::send_pair(gl::kVerd, g.produced, v, g.force);
+            model.link_send_pair(gl::kVerd, g.produced, v, g.force, le);   // (queued behind rows not sent yet)
             return v;
         }
         int32_t v = 0, fz = -1;
@@ -3013,6 +3018,7 @@ static int glm_pack_generate(const Options& o) {
     };
     // a just-admitted request's first token, while the tail's logits are still its own
     const auto resolve_ready = [&]() -> bool {
+        if (lmf && !model.link_flush(err)) return false;   // (the back reads what is queued first)
         for (auto& gp : gens) {
             Gen& g = *gp;
             if (!g.ready || g.done) continue;
@@ -3050,7 +3056,8 @@ static int glm_pack_generate(const Options& o) {
         flight.clear();
         flight_groups.clear();
         wflight.clear();
-        model.link_out_.clear();   // (the two-box split's front: rows never sent belong to the requests that failed)
+        model.link_out_.clear();   // (the two-box split: rows and tokens never sent belong to the requests that failed)
+        model.link_tok_q_.clear();
         if (in_read_gap) {   // (a prompt is being read: its call ends first, then gap_reset resets them all)
             gap_failed = true;
             prompt_between_err = "the engine failed while other requests decoded during this prompt's read: " + why;
@@ -3320,6 +3327,10 @@ static int glm_pack_generate(const Options& o) {
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
         if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready()) {
             Gen& g = *only;
+            if (lmf && !model.link_flush(err)) {   // (the two-box split: what is queued goes before the stint)
+                multi_fail(err);
+                return;
+            }
             bind_ctx(g.ctx);
             if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
                 if (!model.forward({g.pending}, lg, err)) {
@@ -4278,8 +4289,10 @@ static int glm_pack_generate(const Options& o) {
             } else {
                 took = try_line(line);
                 if (lmf) {
+                    // (a line: everything queued goes out first - what the line starts may wait on the back)
                     std::string le;
-                    if (!model.link_flush(le) || !gl::send_pair(gl::kSched, (int64_t) sched_no, took ? 1 : 0, 0)) {
+                    if (!model.link_send_pair(gl::kSched, (int64_t) sched_no, took ? 1 : 0, 0, le) ||
+                        (took && !model.link_flush(le))) {
                         multi_fail("glm link: down");
                         if (!took) continue;
                     }
@@ -4300,7 +4313,8 @@ static int glm_pack_generate(const Options& o) {
         // THE TWO-BOX SPLIT's front: each command goes to the back as it starts here (a link that went down connects
         // again first; a back that is not there fails the command)
         if (gl::role() == gl::kFront) {
-            if (!gl::idle_check()) {
+            // (tokens of the requests in flight may be waiting to be read: then only whether the link is up)
+            if (multi && !flight.empty() ? !gl::up() : !gl::idle_check()) {
                 if (multi && !gens.empty()) multi_fail("glm link: down");   // (their states are gone on the back)
                 std::string le;
                 if (!gl::reopen(le)) {
