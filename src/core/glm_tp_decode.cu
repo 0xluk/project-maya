@@ -1,6 +1,8 @@
 // Decode-only in-box tensor parallel for the GLM layer split - see glm_tp_decode.hpp.
 #include "glm_tp_decode.hpp"
 
+#include <cuda.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -131,6 +133,25 @@ struct Ctx {
     std::vector<int> dev_of;
 };
 Ctx* g_ctx = nullptr;
+
+// cuStreamWaitValue32 through the runtime's driver entry point (no libcuda link): the stream's front end waits on a
+// host-mapped flag - no kernel, no SM held.  nullptr: not available, events instead.
+using WaitValueFn = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+WaitValueFn wait_value_fn() {
+    static WaitValueFn fn = [] () -> WaitValueFn {
+        const char* v = getenv("MAYA_GLM_TP_WAITVALUE");
+        if (v != nullptr && std::atoi(v) == 0) return nullptr;
+        void* f = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        if (cudaGetDriverEntryPoint("cuStreamWaitValue32", &f, cudaEnableDefault, &q) != cudaSuccess ||
+            q != cudaDriverEntryPointSuccess || f == nullptr) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        return (WaitValueFn) f;
+    }();
+    return fn;
+}
 
 // CUDA's lazy module loading synchronizes a device the first time one of its kernels runs.  With a helper's stream
 // spinning on its owner's input that wait can never end (the host thread that would let the owner on is the one
@@ -360,7 +381,27 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
     for (int h = 0; h < c.nh; ++h) {
         Helper& H = o->helpers[(size_t) h];
         cudaSetDevice(H.dev);
-        if (!spin) cudaStreamWaitEvent(H.s, o->pub, 0);
+        if (!spin) {
+            static const WaitValueFn wv = wait_value_fn();
+            bool waited = false;
+            if (wv != nullptr) {
+                waited = true;
+                for (int b = 0; b < kBlocks && waited; ++b) {
+                    CUdeviceptr fp = 0;
+                    if (cudaHostGetDevicePointer((void**) &fp, o->bflags + b * kFlagStride, 0) != cudaSuccess ||
+                        wv((CUstream) H.s, fp, seq, CU_STREAM_WAIT_VALUE_EQ) != CUDA_SUCCESS) {
+                        cudaGetLastError();
+                        waited = false;
+                    }
+                }
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "glm tp: helpers wait with %s\n", waited ? "cuStreamWaitValue32" : "events");
+                }
+            }
+            if (!waited) cudaStreamWaitEvent(H.s, o->pub, 0);
+        }
         k_fetch<<<kBlocks, kThreads, 0, H.s>>>(o->bhost, words_in, (uint32_t*) H.x, spin ? o->bflags : nullptr, seq, err);
         gf::MvJob HJ[kMaxJobs];
         int off = 0;
