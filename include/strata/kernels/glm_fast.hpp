@@ -59,6 +59,8 @@ bool mv_supported(int type);
 /// while it is non-zero - a pipelined window's tokens after a wrong draft (skip_gate sets it from the host's word);
 /// nullptr (the default): no check.
 void set_skip(const int* flag);
+/// The calling thread's set_skip flag (nullptr: none).
+const int* get_skip();
 /// One thread: *flag = (*host_from <= t) - token t of the window is past the first wrong draft (`host_from`: pinned,
 /// host-mapped, written by the host while the window runs).
 void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s);

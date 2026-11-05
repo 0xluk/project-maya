@@ -18,6 +18,7 @@
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "strata/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
+#include "glm_tp_decode.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -1317,6 +1318,12 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             const int l0 = i == 0 ? first : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : last;
             where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(l1 > 0 ? l1 : g_.n_layers) +
                      ") on CUDA" + std::to_string(devs[(size_t) i]);
+        }
+        // MAYA_GLM_TP_DECODE=1: every part's big GEMVs split across the split's GPUs in single-row decode passes
+        if (strata::core::glmtp::enabled()) {
+            std::string te;
+            if (!tp_decode_setup(parts, te)) std::fprintf(stderr, "glm tp: off - %s\n", te.c_str());
+            else std::fprintf(stderr, "glm tp: decode GEMVs split across %d GPUs\n", n);
         }
         ram_left_check();
     } else {

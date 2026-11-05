@@ -17,6 +17,7 @@
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "strata/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
+#include "glm_tp_decode.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -5517,6 +5518,9 @@ static void fast_dump(cudaStream_t s, const std::string& name, const float* dev,
 
 // ---------------------------------------------------------------- the forward
 // ---- one DSA (MLA + indexer) mixer: F->x / F->xq -> F->mixer at position p (the trunk's DSA layers and the NextN block)
+static int tp_try(bool on, int dev, int il, int grp, const gf::MvJob* sp, int n, const gf::MvJob* lo, int nl,
+                  cudaStream_t s);   // (MAYA_GLM_TP_DECODE, below)
+
 bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -5570,7 +5574,8 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
                             g.idx_heads * g.idx_key}
                 : gf::MvJob{Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
-    if (!gf::mv(j2, all ? 1 : 2, s)) { err = "glm fast: dsa q"; return false; }
+    if (const int t = tp_try(tp_pass_, dev_, il, strata::core::glmtp::kDsaQb, j2, 1, j2 + 1, all ? 0 : 1, s);
+        t < 0 || (t == 0 && !gf::mv(j2, all ? 1 : 2, s))) { err = "glm fast: dsa q"; return false; }
     if (F->prof_on) F->mark("dsa_q_mv");
     if (dumps) {
         fast_dump(s, "dsa_qr-" + std::to_string(il), F->qr, g.q_lora);
@@ -5596,7 +5601,8 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
             F->prof_on ? &mla_marks : nullptr, true);
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type,
                    g.n_head * g.v_head, g.n_embd};
-    if (!gf::mv(&o, 1, s)) { err = "glm fast: dsa output"; return false; }
+    if (const int t = tp_try(tp_pass_, dev_, il, strata::core::glmtp::kDsaOut, &o, 1, nullptr, 0, s);
+        t < 0 || (t == 0 && !gf::mv(&o, 1, s))) { err = "glm fast: dsa output"; return false; }
     if (F->prof_on) F->mark("dsa_out_mv");
     return true;
 }
@@ -5804,6 +5810,85 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     return true;
 }
 
+// MAYA_GLM_TP_DECODE: the GEMV group split across the split's GPUs (1), not split (0: the caller runs gf::mv), or an
+// error (-1)
+static int tp_try(bool on, int dev, int il, int grp, const gf::MvJob* sp, int n, const gf::MvJob* lo, int nl,
+                  cudaStream_t s) {
+    if (!on) return 0;
+    bool ok = true;
+    if (!strata::core::glmtp::mv(dev, il, grp, sp, n, lo, nl, s, ok)) return 0;
+    return ok ? 1 : -1;
+}
+
+bool Glm5Model::tp_decode_setup(const std::vector<Glm5Model*>& parts, std::string& err) {
+    namespace tp = strata::core::glmtp;
+    std::vector<tp::PartDesc> pd;
+    for (Glm5Model* m : parts) {
+        if (m->fast_ == nullptr) { err = "a part without the fast path"; return false; }
+        const Glm5Geometry& g = m->g_;
+        tp::PartDesc d;
+        d.dev = m->dev_;
+        const auto mat = [](const WSlot& w, int64_t ni, int64_t no) {
+            tp::Mat x;
+            x.w = w.q;
+            x.type = w.type;
+            x.n_in = ni;
+            x.n_out = no;
+            return x;
+        };
+        for (int il = m->l0_; il < m->l1_; ++il) {
+            if (il == m->mtp_il_) continue;
+            const auto& Ly = m->fast_->L[(size_t) il];
+            if (Ly.mtp || Ly.exl3) continue;
+            tp::GroupDesc gd;
+            gd.il = il;
+            if (Ly.recr) {
+                const int DI = g.d_inner();
+                if (Ly.q.q && Ly.k.q && Ly.v.q) {
+                    gd.grp = tp::kKdaQkv;
+                    gd.n = 3;
+                    gd.m[0] = mat(Ly.q, g.n_embd, DI);
+                    gd.m[1] = mat(Ly.k, g.n_embd, DI);
+                    gd.m[2] = mat(Ly.v, g.n_embd, DI);
+                    d.groups.push_back(gd);
+                }
+                if (Ly.out.q) {
+                    gd.grp = tp::kKdaOut;
+                    gd.n = 1;
+                    gd.m[0] = mat(Ly.out, DI, g.n_embd);
+                    d.groups.push_back(gd);
+                }
+            } else {
+                if (Ly.q_b.q) {
+                    gd.grp = tp::kDsaQb;
+                    gd.n = 1;
+                    gd.m[0] = mat(Ly.q_b, g.q_lora, (int64_t) g.n_head * g.qk_nope);
+                    d.groups.push_back(gd);
+                }
+                if (Ly.out.q) {
+                    gd.grp = tp::kDsaOut;
+                    gd.n = 1;
+                    gd.m[0] = mat(Ly.out, (int64_t) g.n_head * g.v_head, g.n_embd);
+                    d.groups.push_back(gd);
+                }
+            }
+            if (!Ly.moe && Ly.ffn_gate.q && Ly.ffn_up.q && Ly.ffn_down.q) {
+                gd.grp = tp::kDenseGu;
+                gd.n = 2;
+                gd.m[0] = mat(Ly.ffn_gate, g.n_embd, g.n_ff_dense);
+                gd.m[1] = mat(Ly.ffn_up, g.n_embd, g.n_ff_dense);
+                d.groups.push_back(gd);
+                gd.grp = tp::kDenseDown;
+                gd.n = 1;
+                gd.m[0] = mat(Ly.ffn_down, g.n_ff_dense, g.n_embd);
+                d.groups.push_back(gd);
+            }
+        }
+        pd.push_back(std::move(d));
+    }
+    return tp::setup(pd, err);
+}
+
 bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     (void) hop_in;
     FastState* F = fast_;
@@ -5828,6 +5913,13 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         return false;
     }
     bool deferred = false;   // the previous layer's CPU answer is still out
+    // MAYA_GLM_TP_DECODE: this single-row pass splits its big GEMVs across the split's GPUs
+    const bool tp = strata::core::glmtp::active(dev_) && !graphs && F->win.pipe_t < 0 && !dumps;
+    tp_pass_ = tp;
+    struct TpOff {
+        bool& f;
+        ~TpOff() { f = false; }
+    } tp_off{tp_pass_};
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -5886,7 +5978,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             j[3] = {Ly.f_a, nullptr, F->x, pfa, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
             j[4] = {Ly.g_a, nullptr, F->x, pga, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, F->x, pbeta, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_head};
-            if (!gf::mv(j, 6, s)) { err = "glm fast: kda projections"; return false; }
+            if (const int t = tp_try(tp, dev_, il, strata::core::glmtp::kKdaQkv, j, 3, j + 3, 3, s);
+                t < 0 || (t == 0 && !gf::mv(j, 6, s))) { err = "glm fast: kda projections"; return false; }
             if (F->prof_on) F->mark("kda_proj_mv");
             gf::KdaPrepArgs k;
             for (int i = 0; i < 3; ++i) {
@@ -5913,7 +6006,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                         Ly.ssm_norm, g.norm_eps, g.n_head, g.kda_head_dim, F->gated_q, s);
             if (F->prof_on) F->mark("kda_rec");
             gf::MvJob o = {Ly.out.q, F->gated_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type, DI, g.n_embd};
-            if (!gf::mv(&o, 1, s)) { err = "glm fast: kda output"; return false; }
+            if (const int t = tp_try(tp, dev_, il, strata::core::glmtp::kKdaOut, &o, 1, nullptr, 0, s);
+                t < 0 || (t == 0 && !gf::mv(&o, 1, s))) { err = "glm fast: kda output"; return false; }
             if (F->prof_on) F->mark("kda_out_mv");
         } else {
             if (!fast_dsa(il, p, err)) return false;
@@ -5946,13 +6040,15 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             gf::MvJob j[2];
             j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
             j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
-            if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
+            if (const int t = tp_try(tp, dev_, il, strata::core::glmtp::kDenseGu, j, 2, nullptr, 0, s);
+                t < 0 || (t == 0 && !gf::mv(j, 2, s))) { err = "glm fast: dense ffn"; return false; }
             if (F->prof_on) F->mark("dense_gu_mv");
             gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
             if (F->prof_on) F->mark("dense_swiglu");
             gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
                             g.n_embd};
-            if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
+            if (const int t = tp_try(tp, dev_, il, strata::core::glmtp::kDenseDown, &dn, 1, nullptr, 0, s);
+                t < 0 || (t == 0 && !gf::mv(&dn, 1, s))) { err = "glm fast: dense ffn down"; return false; }
             if (F->prof_on) F->mark("dense_down_mv");
         } else {
             const bool def = defer && il + 1 < l1_ && F->cpu_fmt[(size_t) il].n_ff > 0;
@@ -6316,6 +6412,9 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
         }
     } else {
         b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
+        // MAYA_GLM_TP_DECODE: room for the other parts' weight slices (glmtp::setup, after every part loaded)
+        if (const size_t tp = strata::core::glmtp::reserve_bytes(part); tp > 0 && part >= 0)
+            b.avail = b.avail > tp ? b.avail - tp : 0;
     }
     if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);
 

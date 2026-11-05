@@ -7243,6 +7243,8 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
     launch_check("rms_q8");
 }
 
+const int* get_skip() { return g_skip; }
+
 void set_skip(const int* flag) {
     g_skip = flag;
     exl3::set_skip(flag);   // (the EXL3 weights' kernels: the same flag)
