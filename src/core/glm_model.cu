@@ -16,6 +16,7 @@
 // The DSA caches are append-only (latent column per token; a pool's key when its last member
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
+#include "strata/core/glm_link.hpp"
 #include "glm_fast_state.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
@@ -1070,6 +1071,20 @@ int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err
     // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
     if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && sp.penalty_last_n <= 0 && last_tok_ >= 0)
         return last_tok_;
+    // the two-box split: the back samples (it has the logits), the front reads its pick
+    if (strata::core::glmlink::role() == strata::core::glmlink::kFront) {
+        int32_t tk = -1;
+        return strata::core::glmlink::recv_tok(strata::core::glmlink::kSample, pos_, tk, err) ? tk : -1;
+    }
+    if (strata::core::glmlink::role() == strata::core::glmlink::kBack) {
+        const int tok = fast_ != nullptr ? fast_sample(sp, err) : -1;
+        if (tok < 0) strata::core::glmlink::abort_link(err.empty() ? "the sampler failed" : err);
+        else if (!strata::core::glmlink::send_tok(strata::core::glmlink::kSample, pos_, tok)) {
+            err = "glm link: down";
+            return -1;
+        }
+        return tok;
+    }
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     if (tail->d_tok_ == nullptr) {
@@ -1961,6 +1976,31 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
+    // the two-box split (strata/core/glm_link.hpp, --role front|back): this process loads ONE part of a two-part split
+    // at layer K on its first visible GPU, and the link carries the boundary
+    if (strata::core::glmlink::role() != strata::core::glmlink::kNone) {
+        const int K = std::atoi(spec.c_str());
+        if (spec.empty() || spec.find_first_not_of("0123456789") != std::string::npos || K < 1) {
+            err = "glm link: --role needs --layer-split K (the back's first layer)";
+            return false;
+        }
+        const bool front = strata::core::glmlink::role() == strata::core::glmlink::kFront;
+        n_parts_ = 2;
+        part_ = front ? 0 : 1;
+        if (!load_pack(pack_dir, max_ctx, err, 0, front ? 0 : K, front ? K : 0)) return false;
+        // both sides cut every prompt into the same chunks: the smaller side's chunk (none if either has none)
+        int peer = 0;
+        if (!strata::core::glmlink::open(K, max_ctx, prefill_chunk(), peer, err)) return false;
+        if (peer <= 0 || prefill_chunk() <= 0) {
+            if (pf_ != nullptr) prefill_destroy();
+        } else if (peer < prefill_chunk()) {
+            prefill_cap(peer, "the other box's");
+        }
+        cudaSetDevice(dev_);
+        std::fprintf(stderr, "glm split: layers [%d, %d) on CUDA%d, the %s of a two-box split over the link\n", l0_,
+                     l1_, dev_, strata::core::glmlink::role_name());
+        return true;
+    }
     // STRATA_GLM_EXPERT_HELPER=<device>: the expert helper - alone beside one trunk GPU (no split: dense, state and
     // MTP stay on device 0), or beside a layer split, which then leaves the helper's device out and gives each part
     // its own share of the helper over its own layers (fast_helper_setup): two cards and a Ryzen AI Max APU
