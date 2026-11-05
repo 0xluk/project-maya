@@ -195,7 +195,7 @@ bool helper_part(int part) {
 size_t reserve_bytes(int part) {
     if (!enabled() || !helper_part(part)) return 0;
     const char* v = getenv("MAYA_GLM_TP_RESERVE_MB");
-    return (size_t) (v != nullptr ? std::max(0LL, std::atoll(v)) : 850LL) << 20;
+    return (size_t) (v != nullptr ? std::max(0LL, std::atoll(v)) : 400LL) << 20;
 }
 
 bool active(int dev) {

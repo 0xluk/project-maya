@@ -5,6 +5,12 @@
 // own weights, the other GPUs ("helpers") compute the rest from row-slice copies made at load time.  The q8_1 input is
 // broadcast and the output rows gathered through pinned, host-mapped memory (no peer access needed).  Every row is
 // computed by the same kernel from the same input, so the results are bit-identical to the unsplit GEMVs.
+//
+// Ordering: a helper's stream starts its part of a group on a CUDA event the owner records after publishing the input
+// (no kernel spins on a helper: spinning helpers deadlocked behind other waiting work); the owner spins on the helpers'
+// flags, which only wait for work already queued.  The slices cost VRAM the expert pool would otherwise get
+// (MAYA_GLM_TP_RESERVE_MB); MAYA_GLM_TP_HELPERS limits which parts lend their GPU.  Knobs for A/B: MAYA_GLM_TP_DRY=1
+// (set up, never split), MAYA_GLM_TP_CHECK=1 (every split group compared with the full GEMV).
 #pragma once
 
 #include "strata/kernels/glm_fast.hpp"
@@ -23,7 +29,7 @@ constexpr int kMaxJobs = 3;
 
 /// MAYA_GLM_TP_DECODE=1
 bool enabled();
-/// VRAM each part leaves outside its expert pool for the helpers' weight slices (MAYA_GLM_TP_RESERVE_MB, default 850)
+/// VRAM each part leaves outside its expert pool for the helpers' weight slices (MAYA_GLM_TP_RESERVE_MB, default 400)
 size_t reserve_bytes(int part);
 /// MAYA_GLM_TP_HELPERS: whether split part `part` lends its GPU to the other parts (default: every part)
 bool helper_part(int part);

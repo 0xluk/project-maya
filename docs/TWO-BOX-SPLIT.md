@@ -109,6 +109,46 @@ Limits:
 - Greedy answers of concurrent requests match a request alone until the first near-tie between two tokens. Production
   runs of the same prompt split at the same places, because expert placement changes the order sums are done in.
 
+## Decode-only tensor parallel inside a box (`MAYA_GLM_TP_DECODE`, opt-in)
+
+With the layer split, one GPU of a box works on a token at a time. `MAYA_GLM_TP_DECODE=1` lets the other GPUs of the
+box help with the biggest GEMVs of every single-row decode pass. The GPU that owns a layer still runs it, but these
+Q8_0 GEMVs are split by output rows across the box's GPUs:
+
+| layer | split GEMVs | stays on the owner |
+|---|---|---|
+| linear attention (KDA) | q/k/v, output | f/g/beta projections, conv, recurrence, norms |
+| DSA (MLA) | q_b, output | q_a, kv_a, indexer, sparse attention, latent cache |
+| dense FFN (layers 0-2) | gate/up, down | swiglu |
+| MoE FFN, NextN, head | none | everything (routed + shared experts stay layer-local) |
+
+The owner computes the first quarter of the rows from its own weights. The other GPUs compute the rest from row-slice
+copies made at load time. The q8_1 input goes out, and the rows come back, through pinned host-mapped memory (no peer
+access needed). Each row is computed by the same kernel from the same input, so the split is **bit-identical** to the
+unsplit GEMVs. Prompt reading, the expert pool, the link and the hop are unchanged.
+
+| variable | default | meaning |
+|---|---|---|
+| `MAYA_GLM_TP_DECODE` | 0 | 1 = split the decode GEMVs across this side's GPUs |
+| `MAYA_GLM_TP_RESERVE_MB` | 400 | VRAM each lending GPU keeps out of its expert pool for the slices |
+| `MAYA_GLM_TP_HELPERS` | all | split-part indices that lend their GPU (e.g. `0`) |
+| `MAYA_GLM_TP_DRY` / `MAYA_GLM_TP_CHECK` | 0 | A/B aids: set up but never split / compare every split with the full GEMV |
+
+The cost is VRAM: the slices (0.24-0.40 GB per GPU here) come out of the expert pool. On the front box (20 GB RAM) that
+pushed experts to SSD and halved the prompt speed, so **enable it on the back only** (32 GB RAM absorbs the smaller
+pool). Measured on the same rigs (greedy, 400-token answers; two runs each):
+
+| | production | TP on the back |
+|---|---|---|
+| decode, short prompts | 39.9 tok/s | 42.6-43.6 tok/s (+7-9%) |
+| decode after a 25K prompt | 36.3-37.3 | 36.6-36.7 |
+| 25K prompt read | 1,042 tok/s | 1,009-1,016 (-3%) |
+| KL vs single-box reference (s2) | 2.25e-2 | 2.08e-2 (gate 2.5e-2) |
+
+Both sides on (front 4-way): +7% decode but prompts 2-4x slower (SSD). Front lending only CUDA0 (the one with spare
+pool) and the back on: same decode gain as the back alone. The gain is below a full TP's because only these GEMVs are
+split, the routed experts stay layer-local, and each split group pays ~20-50 µs of host-staged exchange.
+
 ## Correctness
 
 Teacher-forced logits (`STRATA_GLM_KL_DUMP` with `maya generate --tokens-file`) against a single-process run on one
