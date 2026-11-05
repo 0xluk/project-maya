@@ -140,7 +140,7 @@ using WaitValueFn = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int
 WaitValueFn wait_value_fn() {
     static WaitValueFn fn = [] () -> WaitValueFn {
         const char* v = getenv("MAYA_GLM_TP_WAITVALUE");
-        if (v != nullptr && std::atoi(v) == 0) return nullptr;
+        if (v == nullptr || std::atoi(v) == 0) return nullptr;   // (opt-in: measured slower than events)
         void* f = nullptr;
         cudaDriverEntryPointQueryResult q;
         if (cudaGetDriverEntryPoint("cuStreamWaitValue32", &f, cudaEnableDefault, &q) != cudaSuccess ||
@@ -178,8 +178,22 @@ bool enabled() {
     return on;
 }
 
-size_t reserve_bytes() {
-    if (!enabled()) return 0;
+bool helper_part(int part) {
+    // MAYA_GLM_TP_HELPERS=<i,j,..>: only these parts (split order) lend their GPU to the others' GEMVs (default: all)
+    const char* v = getenv("MAYA_GLM_TP_HELPERS");
+    if (v == nullptr || !v[0]) return true;
+    for (const char* q = v; *q;) {
+        char* e = nullptr;
+        const long x = std::strtol(q, &e, 10);
+        if (e == q) break;
+        if (x == part) return true;
+        q = *e ? e + 1 : e;
+    }
+    return false;
+}
+
+size_t reserve_bytes(int part) {
+    if (!enabled() || !helper_part(part)) return 0;
     const char* v = getenv("MAYA_GLM_TP_RESERVE_MB");
     return (size_t) (v != nullptr ? std::max(0LL, std::atoll(v)) : 850LL) << 20;
 }
@@ -189,7 +203,7 @@ bool active(int dev) {
     static const bool dry = getenv("MAYA_GLM_TP_DRY") != nullptr && std::atoi(getenv("MAYA_GLM_TP_DRY")) != 0;
     if (g_ctx == nullptr || dry) return false;
     for (auto& o : g_ctx->owners)
-        if (o->dev == dev) return true;
+        if (o->dev == dev) return !o->groups.empty();
     return false;
 }
 
@@ -251,7 +265,7 @@ bool setup(const std::vector<PartDesc>& parts, std::string& err) {
         cudaSetDevice(o->dev);
         cudaEventCreateWithFlags(&o->pub, cudaEventDisableTiming);
         for (int hi = 0, q = 0; q < P; ++q) {
-            if (q == pi) continue;
+            if (q == pi || !helper_part(q)) continue;
             Helper h;
             h.dev = parts[(size_t) q].dev;
             h.host = (uint32_t*) base;
@@ -279,9 +293,10 @@ bool setup(const std::vector<PartDesc>& parts, std::string& err) {
                 const Mat& m = gd.m[j];
                 const size_t rb = gf::row_bytes(m.type, m.n_in);
                 if (rb == 0 || m.w == nullptr || m.n_out % 32 != 0) { ok = false; break; }
-                gs.own_rows[j] = split_point(m.n_out, 1, P);
-                for (int h = 0; h < NH; ++h) {
-                    const int64_t r0 = split_point(m.n_out, h + 1, P), r1 = split_point(m.n_out, h + 2, P);
+                const int PP = (int) o->helpers.size() + 1;
+                gs.own_rows[j] = split_point(m.n_out, 1, PP);
+                for (int h = 0; h + 1 < PP; ++h) {
+                    const int64_t r0 = split_point(m.n_out, h + 1, PP), r1 = split_point(m.n_out, h + 2, PP);
                     Slice& s = gs.sl[h][j];
                     s.r0 = r0;
                     s.rows = r1 - r0;
@@ -307,7 +322,7 @@ bool setup(const std::vector<PartDesc>& parts, std::string& err) {
             }
             if (!ok) continue;
             int64_t out_max = 0;
-            for (int h = 0; h < NH; ++h) {
+            for (int h = 0; h < (int) o->helpers.size(); ++h) {
                 int64_t t = 0;
                 for (int j = 0; j < gd.n; ++j) t += gs.sl[h][j].rows;
                 out_max = std::max(out_max, t);
@@ -315,6 +330,7 @@ bool setup(const std::vector<PartDesc>& parts, std::string& err) {
             if ((size_t) out_max * sizeof(float) > kOutMax) continue;
             o->groups[gd.il * kGroups + gd.grp] = gs;
         }
+        if (o->helpers.empty()) o->groups.clear();
         C->owners.push_back(std::move(o));
     }
     for (int q = 0; q < P; ++q) {

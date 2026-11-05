@@ -6413,7 +6413,7 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
     } else {
         b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
         // MAYA_GLM_TP_DECODE: room for the other parts' weight slices (glmtp::setup, after every part loaded)
-        if (const size_t tp = strata::core::glmtp::reserve_bytes(); tp > 0 && part >= 0)
+        if (const size_t tp = strata::core::glmtp::reserve_bytes(part); tp > 0 && part >= 0)
             b.avail = b.avail > tp ? b.avail - tp : 0;
     }
     if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);

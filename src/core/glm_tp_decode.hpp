@@ -24,7 +24,9 @@ constexpr int kMaxJobs = 3;
 /// MAYA_GLM_TP_DECODE=1
 bool enabled();
 /// VRAM each part leaves outside its expert pool for the helpers' weight slices (MAYA_GLM_TP_RESERVE_MB, default 850)
-size_t reserve_bytes();
+size_t reserve_bytes(int part);
+/// MAYA_GLM_TP_HELPERS: whether split part `part` lends its GPU to the other parts (default: every part)
+bool helper_part(int part);
 
 struct Mat {
     const void* w = nullptr;
