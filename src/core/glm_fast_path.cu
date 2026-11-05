@@ -5518,6 +5518,9 @@ static void fast_dump(cudaStream_t s, const std::string& name, const float* dev,
 
 // ---------------------------------------------------------------- the forward
 // ---- one DSA (MLA + indexer) mixer: F->x / F->xq -> F->mixer at position p (the trunk's DSA layers and the NextN block)
+static int tp_try(bool on, int dev, int il, int grp, const gf::MvJob* sp, int n, const gf::MvJob* lo, int nl,
+                  cudaStream_t s);   // (MAYA_GLM_TP_DECODE, below)
+
 bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;

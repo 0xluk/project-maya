@@ -23,7 +23,7 @@ constexpr int kMaxJobs = 3;
 
 /// MAYA_GLM_TP_DECODE=1
 bool enabled();
-/// VRAM each part leaves outside its expert pool for the helpers' weight slices (MAYA_GLM_TP_RESERVE_MB, default 700)
+/// VRAM each part leaves outside its expert pool for the helpers' weight slices (MAYA_GLM_TP_RESERVE_MB, default 850)
 size_t reserve_bytes();
 
 struct Mat {

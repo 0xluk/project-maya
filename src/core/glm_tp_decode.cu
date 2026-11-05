@@ -32,6 +32,7 @@ __device__ __forceinline__ void wait_flag(const unsigned* flag, unsigned seq, un
         const volatile unsigned* f = flag;
         const unsigned long long t0 = gtime();
         while (*f != seq) {
+            __nanosleep(32);
             if (gtime() - t0 > kSpinNs) {
                 *(volatile unsigned*) err = 1u;
                 break;
@@ -137,7 +138,7 @@ bool enabled() {
 size_t reserve_bytes() {
     if (!enabled()) return 0;
     const char* v = getenv("MAYA_GLM_TP_RESERVE_MB");
-    return (size_t) (v != nullptr ? std::max(0LL, std::atoll(v)) : 700LL) << 20;
+    return (size_t) (v != nullptr ? std::max(0LL, std::atoll(v)) : 850LL) << 20;
 }
 
 bool active(int dev) {
