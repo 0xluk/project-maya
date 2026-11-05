@@ -34,9 +34,16 @@
 namespace strata::core::glmlink {
 
 enum Role : int { kNone = 0, kFront = 1, kBack = 2 };
-enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7, kBegin = 8, kEnd = 9, kAck = 10 };
+enum Type : uint32_t { kHello = 1, kHop = 2, kTok = 3, kSample = 4, kErr = 5, kSpec = 6, kCtl = 7, kBegin = 8, kEnd = 9, kAck = 10,
+                    kSched = 11, kVerd = 12 };
 // kSpec (back -> front, the pipelined spec decode): pos = the tail's position, val = its token y, n = the draft d for
 // the position after (-1: none).  kCtl (front -> back): pos = the position the step is for, val = 1 go on / 0 the end
+// Several conversations at once (--parallel over the link; generate.cpp's multi scheduler), front -> back only:
+// kSched: pos = the scheduler's iteration number, val = 1 the front takes a control line now / 0 one scheduler step;
+// kVerd: pos = the request's written-token count, val = the front's verdict on its last token (bit 0 go on, bits 1-2
+// the finish 0 length / 1 stop / 2 cancel, bit 3 pause, bit 4 keep, bit 5 a spec stint interrupted by input), n = the
+// token forced next (-1: none).  The batched rows cross as one HOP per row (its position, n = 1) and come back as one
+// TOK per row, in the order both schedulers issue and take them
 
 struct Hdr {
     uint32_t magic;   // kMagic
@@ -92,6 +99,7 @@ bool idle_check();                    // the front between commands: false if th
 bool reopen(std::string& err);        // the front: connect again (STRATA_GLM_RELINK_WAIT s)
 void wake();                          // the back: the old link's data socket shut (a main thread blocked on it returns)
 bool reaccept(std::string& err);      // the back: accept the front's next connection and HELLO
+uint64_t generation();                // connections made so far (a new front: the old one's requests are gone)
 
 // stats (stderr at exit): hops, bytes, time blocked in send/recv
 void report();

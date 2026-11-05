@@ -845,6 +845,17 @@ public:
     bool split_rows_ok() const;
     bool multi_issue_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                           std::string& err);
+    /// THE TWO-BOX SPLIT (glm_link.hpp) with several conversations: the front's multi_issue_rows queues each row's
+    /// residual (its last local part's pinned hop buffer and event) for the link instead of a head; link_flush sends
+    /// what is queued, in order (one HOP a row), before any later message to the back and before a token is waited
+    /// for.  The back's multi_issue_rows takes the rows from the link, its multi_take sends each token back.
+    bool link_flush(std::string& err);
+    struct LinkRow {
+        int seq;
+        int64_t pos;
+    };
+    std::vector<LinkRow> link_out_;                        // the front: rows issued, not sent yet (oldest first)
+    std::vector<int64_t> link_pos_;                        // a sequence's last issued row's position (its TOK's)
     // ---- several conversations drafting with the NextN block at once (src/core/glm_mtp_rows.cu,
     // STRATA_GLM_MULTI_MTP=<drafts>, off by default).  A conversation's WINDOW - its last written token and its drafts
     // - goes through the split's batched rows as consecutive rows of one group; the last part's head picks every

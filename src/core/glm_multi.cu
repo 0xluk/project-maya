@@ -12,6 +12,7 @@
 // different sequences at the same time: the first card on sequence C while the last one is on A.  The host only waits
 // for the oldest sequence's token (multi_take), and issues that sequence's next one right away.
 #include "glm_fast_state.hpp"
+#include "strata/core/glm_link.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -283,7 +284,40 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     return true;
 }
 
+bool Glm5Model::link_flush(std::string& err) {
+    namespace gl = strata::core::glmlink;
+    if (link_out_.empty()) return true;
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
+    size_t i = 0;
+    bool ok = true;
+    for (; ok && i < link_out_.size(); ++i) {
+        SeqCtx& ct = tail->seq_[(size_t) link_out_[i].seq];
+        cudaSetDevice(tail->dev_);
+        ok = glmfast::wait_event(ct.ev_hop, "glm link rows out", err);
+        for (Glm5Model* m = this; ok && m != nullptr; m = m->split_next_.get()) ok = m->fast_->route_ok(err);
+        ok = ok && gl::send_hop(link_out_[i].pos, 1, ct.hop_h, hop, err);
+    }
+    cudaSetDevice(dev_);
+    link_out_.clear();   // (a failure: the link is down and the requests fail - nothing of these goes later)
+    return ok;
+}
+
 int Glm5Model::multi_take(int s, std::string& err) {
+    namespace gl = strata::core::glmlink;
+    const gl::Role lrole = gl::role();
+    if (lrole == gl::kFront) {
+        // the two-box split's front: the rows queued so far go out first (the back takes them in this order), then
+        // this sequence's token comes back
+        int32_t tk = -1;
+        if (!link_flush(err) || !gl::recv_tok(gl::kTok, link_pos_[(size_t) s], tk, err)) return -1;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (!m->fast_->route_ok(err)) return -1;
+        if (s == cur_seq_) last_tok_ = tk;
+        else seq_[(size_t) s].last_tok = tk;
+        return tk;
+    }
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     SeqCtx& ct = tail->seq_[(size_t) s];
@@ -297,6 +331,10 @@ int Glm5Model::multi_take(int s, std::string& err) {
     }
     cudaSetDevice(dev_);
     const int tok = ct.tok_h[0];
+    if (lrole == gl::kBack && !gl::send_tok(gl::kTok, link_pos_[(size_t) s], tok)) {
+        err = "glm link: down";
+        return -1;
+    }
     if (s == cur_seq_) last_tok_ = tok;
     else seq_[(size_t) s].last_tok = tok;
     return tok;

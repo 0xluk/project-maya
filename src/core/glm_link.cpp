@@ -31,6 +31,7 @@ namespace {
 
 int g_data = -1, g_ctl = -1, g_listen = -1;
 std::atomic<bool> g_up{false};
+std::atomic<uint64_t> g_gen{0};   // generation(): connections made
 // what open() was given (reopen / reaccept HELLO with it again)
 int g_split = 0, g_my_chunk = 0, g_peer_chunk = -1;
 int64_t g_ctx = 0;
@@ -372,6 +373,7 @@ Role role() {
 
 const char* role_name() { return role() == kFront ? "front" : role() == kBack ? "back" : "none"; }
 bool up() { return g_up.load(); }
+uint64_t generation() { return g_gen.load(); }
 int ctl_fd() { return role() == kBack ? g_ctl : -1; }
 
 bool key_ready(std::string& err) {
@@ -606,6 +608,7 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
     }
     if (!hello(err)) return false;
     peer_chunk = g_peer_chunk;
+    g_gen.fetch_add(1);
     g_up.store(true);
     std::fprintf(stderr, "glm link: %s up in %.1f s (boundary layer %d, context %lld, prompt chunks %d / %d, %s)\n",
                  role_name(), ms_since(t0) / 1000.0, split_at, (long long) max_ctx, my_chunk, peer_chunk,
@@ -645,6 +648,7 @@ bool reopen(std::string& err) {
         }
         std::fprintf(stderr, "glm link: front connected again in %.1f s\n", ms_since(t0) / 1000.0);
     }
+    g_gen.fetch_add(1);
     g_up.store(true);
     return true;
 }
@@ -671,6 +675,7 @@ bool reaccept(std::string& err) {
         std::fprintf(stderr, "%s - waiting for another front\n", err.c_str());
         close_fds();
     }
+    g_gen.fetch_add(1);
     g_up.store(true);
     std::fprintf(stderr, "glm link: back up again\n");
     return true;
