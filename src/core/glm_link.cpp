@@ -1,6 +1,7 @@
 // glm_link: see strata/core/glm_link.hpp
 #include "strata/core/glm_link.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -16,12 +17,14 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/random.h>
 #include <sys/uio.h>
 #include <poll.h>
 #include <unistd.h>
-#include <cerrno>
-#include <vector>
 #endif
+#include <cerrno>
+#include <utility>
+#include <vector>
 
 namespace strata::core::glmlink {
 namespace {
@@ -127,8 +130,37 @@ bool split_hostport(const std::string& s, std::string& host, std::string& port) 
     if (c == std::string::npos || c + 1 >= s.size()) return false;
     host = s.substr(0, c);
     port = s.substr(c + 1);
-    if (host.empty()) host = "0.0.0.0";
+    if (host.empty()) host = "127.0.0.1";   // (never "every interface" by omission: the back binds loopback)
     return true;
+}
+
+// THE BACK'S PEERS: STRATA_GLM_LINK_ALLOW / MAYA_GLM_LINK_ALLOW / MAYA_LINK_ALLOW = comma-separated IPv4 addresses the
+// back accepts a front from; unset: loopback (127.0.0.0/8) only.  Any other source is closed at accept().
+bool peer_allowed(int fd, std::string& ip) {
+    struct sockaddr_in a {};
+    socklen_t al = sizeof a;
+    ip = "?";
+    if (::getpeername(fd, (struct sockaddr*) &a, &al) != 0 || a.sin_family != AF_INET) return false;
+    char buf[INET_ADDRSTRLEN] = {0};
+    if (::inet_ntop(AF_INET, &a.sin_addr, buf, sizeof buf) == nullptr) return false;
+    ip = buf;
+    const char* al_env = std::getenv("STRATA_GLM_LINK_ALLOW");
+    if (al_env == nullptr || !al_env[0]) al_env = std::getenv("MAYA_GLM_LINK_ALLOW");
+    if (al_env == nullptr || !al_env[0]) al_env = std::getenv("MAYA_LINK_ALLOW");
+    if (al_env == nullptr || !al_env[0]) return (ntohl(a.sin_addr.s_addr) >> 24) == 127;
+    const std::string list = al_env;
+    size_t i = 0;
+    while (i <= list.size()) {
+        size_t j = list.find(',', i);
+        if (j == std::string::npos) j = list.size();
+        std::string t = list.substr(i, j - i);
+        while (!t.empty() && t.front() == ' ') t.erase(t.begin());
+        while (!t.empty() && t.back() == ' ') t.pop_back();
+        struct in_addr x {};
+        if (!t.empty() && ::inet_pton(AF_INET, t.c_str(), &x) == 1 && x.s_addr == a.sin_addr.s_addr) return true;
+        i = j + 1;
+    }
+    return false;
 }
 
 int connect_once(const std::string& host, const std::string& port) {
@@ -144,6 +176,183 @@ int connect_once(const std::string& host, const std::string& port) {
     freeaddrinfo(res);
     if (fd >= 0) tune(fd);
     return fd;
+}
+#endif
+
+// LINK AUTHENTICATION: STRATA_GLM_LINK_KEY_FILE / MAYA_GLM_LINK_KEY_FILE names a file holding a shared secret (at least
+// 32 bytes; trailing whitespace is dropped).  With it, each connection (DATA, CTRL) proves both ways that the other
+// side holds the same key before anything else crosses: the back sends a 32-byte nonce, the front answers with its
+// own nonce and HMAC-SHA256(key, "front" label | tag | back nonce | front nonce), the back checks it (constant time;
+// a failure is logged and the connection closed, the back keeps listening) and answers with HMAC-SHA256(key, "back"
+// label | tag | front nonce | back nonce), which the front checks.  The env set and the file missing or short: the
+// process does not start.  Unset: no authentication (the allowlist alone).  Self-contained SHA-256 (FIPS 180-4).
+struct Sha256 {
+    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    unsigned char buf[64];
+    uint64_t len = 0;
+    size_t fill = 0;
+    static uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    void block(const unsigned char* p) {
+        static const uint32_t K[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i)
+            w[i] = (uint32_t) p[4 * i] << 24 | (uint32_t) p[4 * i + 1] << 16 | (uint32_t) p[4 * i + 2] << 8 | p[4 * i + 3];
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+            const uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    void update(const void* data, size_t n) {
+        const unsigned char* p = (const unsigned char*) data;
+        len += n;
+        while (n > 0) {
+            const size_t k = std::min(n, (size_t) 64 - fill);
+            std::memcpy(buf + fill, p, k);
+            fill += k; p += k; n -= k;
+            if (fill == 64) { block(buf); fill = 0; }
+        }
+    }
+    void final(unsigned char out[32]) {
+        const uint64_t bits = len * 8;
+        const unsigned char one = 0x80, zero = 0;
+        update(&one, 1);
+        while (fill != 56) update(&zero, 1);
+        unsigned char lb[8];
+        for (int i = 0; i < 8; ++i) lb[i] = (unsigned char) (bits >> (56 - 8 * i));
+        update(lb, 8);
+        for (int i = 0; i < 8; ++i)
+            for (int j = 0; j < 4; ++j) out[4 * i + j] = (unsigned char) (h[i] >> (24 - 8 * j));
+    }
+};
+
+// HMAC-SHA256 (RFC 2104) over the concatenation of parts
+void hmac_sha256(const std::string& key, const std::vector<std::pair<const void*, size_t>>& parts, unsigned char out[32]) {
+    unsigned char k0[64] = {0};
+    if (key.size() > 64) {
+        Sha256 s;
+        s.update(key.data(), key.size());
+        s.final(k0);
+    } else {
+        std::memcpy(k0, key.data(), key.size());
+    }
+    unsigned char ipad[64], opad[64], inner[32];
+    for (int i = 0; i < 64; ++i) { ipad[i] = k0[i] ^ 0x36; opad[i] = k0[i] ^ 0x5c; }
+    Sha256 si;
+    si.update(ipad, 64);
+    for (const auto& p : parts) si.update(p.first, p.second);
+    si.final(inner);
+    Sha256 so;
+    so.update(opad, 64);
+    so.update(inner, 32);
+    so.final(out);
+}
+
+bool ct_equal(const unsigned char* a, const unsigned char* b, size_t n) {
+    volatile unsigned char d = 0;
+    for (size_t i = 0; i < n; ++i) d = d | (unsigned char) (a[i] ^ b[i]);
+    return d == 0;
+}
+
+std::string g_key;          // the link's shared key (empty: no authentication)
+int g_key_state = -1;       // -1 not read yet, 0 failed, 1 read (or no key file set)
+std::string g_key_err;
+
+bool load_key() {
+    if (g_key_state >= 0) return g_key_state == 1;
+    g_key_state = 0;
+    const char* path = env2("STRATA_GLM_LINK_KEY_FILE", "MAYA_GLM_LINK_KEY_FILE");
+    if (path == nullptr || !path[0]) {
+        g_key_state = 1;
+        return true;
+    }
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) {
+        g_key_err = std::string("glm link: MAYA_GLM_LINK_KEY_FILE ") + path + " cannot be read: " + std::strerror(errno);
+        return false;
+    }
+    std::string k;
+    char b[256];
+    size_t r;
+    while ((r = std::fread(b, 1, sizeof b, f)) > 0 && k.size() < 4096) k.append(b, r);
+    std::fclose(f);
+    while (!k.empty() && (k.back() == '\n' || k.back() == '\r' || k.back() == ' ' || k.back() == '\t')) k.pop_back();
+    if (k.size() < 32) {
+        g_key_err = std::string("glm link: MAYA_GLM_LINK_KEY_FILE ") + path + " holds " + std::to_string(k.size()) +
+                    " bytes, at least 32 are needed";
+        return false;
+    }
+    g_key = std::move(k);
+    g_key_state = 1;
+    return true;
+}
+
+#if !defined(_WIN32)
+constexpr size_t kNonce = 32;
+const char kLabelFront[] = "maya-glm-link-auth-v1 front";
+const char kLabelBack[] = "maya-glm-link-auth-v1 back";
+
+bool random_bytes(unsigned char* p, size_t n) {
+    while (n > 0) {
+        const ssize_t r = ::getrandom(p, n, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        p += r;
+        n -= (size_t) r;
+    }
+    return true;
+}
+
+// the back, on an accepted connection (its tag read): true when the front proved the key and got the back's proof
+bool auth_back(int fd, const char tag[4], std::string& why) {
+    if (g_key.empty()) return true;
+    unsigned char nb[kNonce], nf[kNonce], mf[32], want[32], mb[32];
+    if (!random_bytes(nb, kNonce)) { why = "no random bytes for the nonce"; return false; }
+    if (!write_all(fd, nb, kNonce)) { why = "the nonce did not go out"; return false; }
+    if (!read_all(fd, nf, kNonce) || !read_all(fd, mf, 32)) { why = "no authentication reply (no key on the front?)"; return false; }
+    hmac_sha256(g_key, {{kLabelFront, sizeof kLabelFront - 1}, {tag, 4}, {nb, kNonce}, {nf, kNonce}}, want);
+    if (!ct_equal(want, mf, 32)) { why = "authentication failed (wrong link key)"; return false; }
+    hmac_sha256(g_key, {{kLabelBack, sizeof kLabelBack - 1}, {tag, 4}, {nf, kNonce}, {nb, kNonce}}, mb);
+    if (!write_all(fd, mb, 32)) { why = "the proof did not go out"; return false; }
+    return true;
+}
+
+// the front, on a connection (its tag sent): true when both proofs check out
+bool auth_front(int fd, const char tag[4], std::string& why) {
+    if (g_key.empty()) return true;
+    unsigned char nb[kNonce], nf[kNonce], mf[32], want[32], mb[32];
+    struct timeval tv {10, 0}, t0v {0, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    bool ok = false;
+    if (!read_all(fd, nb, kNonce)) why = "the back sent no nonce (no key on the back, or it refused this address)";
+    else if (!random_bytes(nf, kNonce)) why = "no random bytes for the nonce";
+    else {
+        hmac_sha256(g_key, {{kLabelFront, sizeof kLabelFront - 1}, {tag, 4}, {nb, kNonce}, {nf, kNonce}}, mf);
+        if (!write_all(fd, nf, kNonce) || !write_all(fd, mf, 32)) why = "the proof did not go out";
+        else if (!read_all(fd, mb, 32)) why = "the back closed the connection: it rejected this side's proof (wrong link key)";
+        else {
+            hmac_sha256(g_key, {{kLabelBack, sizeof kLabelBack - 1}, {tag, 4}, {nf, kNonce}, {nb, kNonce}}, want);
+            ok = ct_equal(want, mb, 32);
+            if (!ok) why = "the back's proof is wrong (wrong link key)";
+        }
+    }
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t0v, sizeof t0v);
+    return ok;
 }
 #endif
 
@@ -164,6 +373,12 @@ Role role() {
 const char* role_name() { return role() == kFront ? "front" : role() == kBack ? "back" : "none"; }
 bool up() { return g_up.load(); }
 int ctl_fd() { return role() == kBack ? g_ctl : -1; }
+
+bool key_ready(std::string& err) {
+    if (load_key()) return true;
+    err = g_key_err;
+    return false;
+}
 
 #if defined(_WIN32)
 bool open(int, int64_t, int, int&, std::string& err) {
@@ -271,6 +486,14 @@ static bool connect_pair(const std::string& host, const std::string& port, doubl
             err = "glm link: the connection's tag did not go out";
             return false;
         }
+        std::string why;
+        if (!auth_front(fd, tag, why)) {
+            ::close(fd);
+            close_fds();
+            err = std::string("glm link: link authentication failed on the ") + tag + " connection: " + why;
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return false;
+        }
         (which == 0 ? g_data : g_ctl) = fd;
     }
     return true;
@@ -278,6 +501,7 @@ static bool connect_pair(const std::string& host, const std::string& port, doubl
 
 // the back: the front's two connections on the listening socket
 static bool accept_pair(std::string& err) {
+    std::string pair_ip;   // both connections of a pair from one address
     while (g_data < 0 || g_ctl < 0) {
         const int fd = ::accept(g_listen, nullptr, nullptr);
         if (fd < 0) {
@@ -285,18 +509,34 @@ static bool accept_pair(std::string& err) {
             err = std::string("glm link: accept: ") + std::strerror(errno);
             return false;
         }
+        std::string ip;
+        if (!peer_allowed(fd, ip) || (!pair_ip.empty() && ip != pair_ip)) {
+            std::fprintf(stderr, "glm link: refused a connection from %s (not in MAYA_GLM_LINK_ALLOW%s)\n", ip.c_str(),
+                         pair_ip.empty() ? "" : ", or not the pair's address");
+            ::close(fd);
+            continue;
+        }
         tune(fd);
         char tag[4];
         struct timeval tv {10, 0}, t0v {0, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         if (!read_all(fd, tag, 4)) { ::close(fd); continue; }
+        if (std::memcmp(tag, "DATA", 4) != 0 && std::memcmp(tag, "CTRL", 4) != 0) { ::close(fd); continue; }
+        std::string why;
+        if (!auth_back(fd, tag, why)) {
+            std::fprintf(stderr, "glm link: refused a connection from %s: %s\n", ip.c_str(), why.c_str());
+            ::close(fd);
+            continue;
+        }
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t0v, sizeof t0v);
         if (std::memcmp(tag, "DATA", 4) == 0) {
             if (g_data >= 0) ::close(g_data);   // (a front that started over: its newest pair stands)
             g_data = fd;
+            pair_ip = ip;
         } else if (std::memcmp(tag, "CTRL", 4) == 0) {
             if (g_ctl >= 0) ::close(g_ctl);
             g_ctl = fd;
+            pair_ip = ip;
         } else {
             ::close(fd);
         }
@@ -325,6 +565,9 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
     if (const char* b = env2("STRATA_GLM_LINK_BF16", "MAYA_GLM_LINK_BF16")) g_bf16 = std::atoi(b) != 0;
     if (const char* b = env2("STRATA_GLM_LINK_PACK", "MAYA_GLM_LINK_PACK")) g_pack = std::atoi(b) != 0;
     if (!g_bf16) g_pack = false;
+    if (!key_ready(err)) return false;
+    std::fprintf(stderr, "glm link: authentication %s\n",
+                 g_key.empty() ? "OFF (no MAYA_GLM_LINK_KEY_FILE; the allowlist only)" : "on (HMAC-SHA256 challenge-response, both ways)");
     const auto t0 = std::chrono::steady_clock::now();
     if (role() == kFront) {
         double wait_s = 1800;
@@ -332,10 +575,12 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
         std::fprintf(stderr, "glm link: front connecting to %s:%s\n", host.c_str(), port.c_str());
         if (!connect_pair(host, port, wait_s, err)) return false;
     } else {
+        // the address to listen on: STRATA_GLM_LINK_BIND / MAYA_GLM_LINK_BIND, else the --link host (empty: loopback)
+        if (const char* b = env2("STRATA_GLM_LINK_BIND", "MAYA_GLM_LINK_BIND"); b != nullptr && b[0]) host = b;
         struct addrinfo hints {}, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags = AI_PASSIVE;
+        hints.ai_flags = AI_NUMERICSERV;
         if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || res == nullptr) {
             err = "glm link: cannot resolve " + host;
             return false;
@@ -350,7 +595,13 @@ bool open(int split_at, int64_t max_ctx, int my_chunk, int& peer_chunk, std::str
         }
         freeaddrinfo(res);
         g_listen = ls;   // (kept: the next front is accepted on it - reaccept)
-        std::fprintf(stderr, "glm link: back listening on %s:%s\n", host.c_str(), port.c_str());
+        {
+            const char* al = std::getenv("STRATA_GLM_LINK_ALLOW");
+            if (al == nullptr || !al[0]) al = std::getenv("MAYA_GLM_LINK_ALLOW");
+            if (al == nullptr || !al[0]) al = std::getenv("MAYA_LINK_ALLOW");
+            std::fprintf(stderr, "glm link: back listening on %s:%s, fronts accepted from %s\n", host.c_str(), port.c_str(),
+                         al != nullptr && al[0] ? al : "loopback only (set MAYA_GLM_LINK_ALLOW)");
+        }
         if (!accept_pair(err)) return false;
     }
     if (!hello(err)) return false;
@@ -486,17 +737,21 @@ static size_t pack_block(const float* src, size_t k, std::vector<uint8_t>& out) 
     std::memcpy(out.data(), &h, sizeof h);
     return total;
 }
-static bool unpack_block(const uint8_t* p, size_t k_want, uint32_t* dst) {
+// p: the whole block as read (buf bytes: its u32 length + 4); false on a block that does not fit its own length
+static bool unpack_block(const uint8_t* p, size_t buf, size_t k_want, uint32_t* dst) {
     PackHdr h;
+    if (buf < sizeof h) return false;
     std::memcpy(&h, p, sizeof h);
-    if (h.k != k_want) return false;
+    if (h.k != k_want || h.n_esc > h.k || (size_t) h.len + 4 != buf) return false;
+    if (sizeof(PackHdr) + (size_t) h.k + ((size_t) h.k + 1) / 2 + (size_t) h.n_esc > buf) return false;
     const uint8_t* lo = p + sizeof(PackHdr);
     const uint8_t* nib = lo + h.k;
     const uint8_t* esc = nib + (h.k + 1) / 2;
     size_t e = 0;
     for (size_t j = 0; j < h.k; ++j) {
         const uint8_t c = (uint8_t) ((nib[j >> 1] >> ((j & 1) * 4)) & 15);
-        const uint8_t hi = c == 15 ? (e < h.n_esc ? esc[e++] : 0) : h.table[c];
+        if (c == 15 && (e >= h.n_esc || esc + e >= p + buf)) return false;   // (every escape inside the block)
+        const uint8_t hi = c == 15 ? esc[e++] : h.table[c];
         dst[j] = ((uint32_t) hi << 24) | ((uint32_t) lo[j] << 16);
     }
     return e == h.n_esc;
@@ -549,6 +804,16 @@ bool send_hop(int64_t pos, int n, const void* data, size_t bytes, std::string& e
 }
 
 // read one header; an ERR from the other side becomes this side's error
+// an ERR's text: at most kMaxErrBytes (a longer one is not read - the caller drops the link)
+constexpr uint64_t kMaxErrBytes = 4096;
+constexpr uint64_t kMaxHopBytes = 4ull << 30;   // a HOP's payload bound for dropped messages (an 8K chunk is 512 MB)
+static bool read_err(const Hdr& h, std::string& why) {
+    if (h.bytes > kMaxErrBytes) return false;
+    why.assign((size_t) h.bytes, '\0');
+    if (h.bytes > 0 && !read_all(g_data, &why[0], (size_t) h.bytes)) why = "?";
+    return true;
+}
+
 static bool recv_hdr(Hdr& h, uint32_t want, std::string& err) {
     if (!read_all(g_data, &h, sizeof h) || h.magic != kMagic) {
         fail(err, "the connection is lost");
@@ -563,9 +828,17 @@ static bool recv_hdr(Hdr& h, uint32_t want, std::string& err) {
         return false;
     }
     if (h.type == kErr) {
-        std::string why((size_t) h.bytes, '\0');
-        if (h.bytes > 0 && !read_all(g_data, &why[0], (size_t) h.bytes)) why = "?";
+        std::string why;
+        if (!read_err(h, why)) {
+            fail(err, "an ERR of " + std::to_string((unsigned long long) h.bytes) + " bytes (over 4 KiB: a protocol error)");
+            return false;
+        }
         fail(err, "the other side failed: " + why);
+        return false;
+    }
+    if (h.type != kHop && h.bytes != 0) {   // (only a HOP and an ERR carry a payload)
+        fail(err, "message " + std::to_string(h.type) + " with a payload of " +
+                      std::to_string((unsigned long long) h.bytes) + " bytes (a protocol error)");
         return false;
     }
     if (h.type != want) {
@@ -602,7 +875,11 @@ bool recv_hop(int64_t pos, int n, void* dst, size_t bytes, std::string& err) {
             if (!ok) break;
             st.resize(len + 4);
             std::memcpy(st.data(), &len, 4);
-            ok = read_all(g_data, st.data() + 4, len) && unpack_block(st.data(), k, out + i);
+            if (!(ok = read_all(g_data, st.data() + 4, len))) break;
+            if (!unpack_block(st.data(), (size_t) len + 4, k, out + i)) {
+                fail(err, "a packed HOP block that does not fit its length (a protocol error)");
+                return false;
+            }
             wire += len + 4;
         }
     } else {
@@ -641,8 +918,9 @@ bool send_tok(Type t, int64_t pos, int32_t tok) {
 
 void abort_link(const std::string& why) {
     if (!up() || g_data < 0) return;
-    Hdr e{kMagic, kErr, 0, 0, 0, (uint64_t) why.size()};
-    send_msg(e, why.data(), why.size());
+    const size_t wn = std::min<size_t>(why.size(), 4096);   // (the receiver drops a longer ERR as a protocol error)
+    Hdr e{kMagic, kErr, 0, 0, 0, (uint64_t) wn};
+    send_msg(e, why.data(), wn);
     std::string err;
     fail(err, "aborted: " + why);
     ::shutdown(g_data, SHUT_RDWR);
@@ -727,16 +1005,25 @@ static bool drain_until(uint32_t t, Hdr& h, int& dropped, std::string& err) {
         }
         if (h.type == t) return true;
         if (h.type == kErr) {
-            std::string why((size_t) h.bytes, '\0');
-            if (h.bytes > 0 && !read_all(g_data, &why[0], (size_t) h.bytes)) why = "?";
+            std::string why;
+            if (!read_err(h, why)) {
+                fail(err, "an ERR of " + std::to_string((unsigned long long) h.bytes) + " bytes (over 4 KiB: a protocol error)");
+                return false;
+            }
             fail(err, "the other side failed: " + why);
+            return false;
+        }
+        // (a dropped message's payload: a HOP's rows at most - the context's whole prompt chunk, fp32)
+        if ((h.type != kHop && h.bytes != 0) || h.bytes > kMaxHopBytes) {
+            fail(err, "message " + std::to_string(h.type) + " with a payload of " +
+                          std::to_string((unsigned long long) h.bytes) + " bytes (a protocol error)");
             return false;
         }
         ++dropped;
         if (h.type == kHop && h.val == 2) {   // a packed hop: its blocks say their length
             for (uint64_t left = h.bytes; left > 0;) {
                 uint32_t len = 0, k = 0;
-                if (!read_all(g_data, &len, 4) || len < 4 || len > 4 * kBlk) {
+                if (!read_all(g_data, &len, 4) || len < sizeof(PackHdr) - 4 || len > 4 * kBlk) {
                     fail(err, "the connection is lost");
                     return false;
                 }

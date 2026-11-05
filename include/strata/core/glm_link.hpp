@@ -18,6 +18,13 @@
 // and kEnd/kAck (the front's end: the back stops wherever it waits - kEnd in place of any message is a cancel - and
 // acknowledges with its position; anything stale before the marker is dropped).
 // STRATA_GLM_LINK_BF16=1 (default): the boundary rows cross as bf16 (rounded to nearest even, upcast on the back).
+// The back listens on STRATA_GLM_LINK_BIND (else the --link host; an empty host is loopback, never every interface) and
+// accepts a front only from the addresses in STRATA_GLM_LINK_ALLOW / MAYA_GLM_LINK_ALLOW (comma-separated IPv4;
+// unset: loopback only).  Malformed lengths (an ERR over 4 KiB, a payload on a message without one, a packed block
+// that does not fit its own length) are protocol errors: the link drops.
+// Several local GPUs per side: --layer-split K:b1,b2,.. (glm_model.cu load_pack_place).
+// STRATA_GLM_LINK_KEY_FILE / MAYA_GLM_LINK_KEY_FILE: a shared key (>= 32 bytes) - every connection runs an HMAC-SHA256
+// challenge-response both ways before HELLO (glm_link.cpp); a connection that fails it is closed.
 #pragma once
 
 #include <cstddef>
@@ -45,6 +52,8 @@ constexpr int64_t kVersion = 2;
 Role role();                          // from STRATA_GLM_ROLE / MAYA_GLM_ROLE (cached)
 const char* role_name();
 bool up();                            // the link is connected and healthy
+// the link key (MAYA_GLM_LINK_KEY_FILE): false + err when it is set and the file is missing or short (checked at load)
+bool key_ready(std::string& err);
 
 // open the link (front: connect, retrying up to STRATA_GLM_LINK_WAIT seconds, default 1800; back: listen, accept both
 // connections) and exchange HELLO.  my_chunk: this side's prompt chunk; peer_chunk: the other side's.

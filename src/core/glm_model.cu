@@ -1982,6 +1982,7 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // the two-box split (strata/core/glm_link.hpp, --role front|back): this process loads ONE part of a two-part split
     // at layer K on its first visible GPU, and the link carries the boundary
     if (strata::core::glmlink::role() != strata::core::glmlink::kNone) {
+        if (!strata::core::glmlink::key_ready(err)) return false;   // (a set but bad link key: refuse before loading)
         // --layer-split K: one part on the first visible GPU; K:b1,b2,..: this side's layers over several local GPUs
         // (b = the first layer of each later local part - the front's lie below K, the back's above), each local
         // boundary an ordinary in-process hop, the link between the front's last part and the back's first
