@@ -14,6 +14,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "strata/core/glm_link.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/platform/idle_gate.hpp"
@@ -1161,7 +1162,8 @@ static int glm_pack_generate(const Options& o) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
-        std::FILE* f = std::fopen(path.c_str(), "wb");
+        // (the two-box split: the back writes the logits; the front's would be zeros)
+        std::FILE* f = std::fopen(strata::core::glmlink::role() == strata::core::glmlink::kFront ? "/dev/null" : path.c_str(), "wb");
         if (f == nullptr) {
             std::fprintf(stderr, "maya generate: cannot write %s\n", path.c_str());
             return 1;
@@ -1211,6 +1213,11 @@ static int glm_pack_generate(const Options& o) {
     std::condition_variable in_cv;
     std::deque<std::string> in_lines;
     bool in_eof = false;
+    // the two-box split's back (glm_link.hpp): the main thread is on a command of the current front (its reconnect
+    // waits until it is not); it stays up for the next front unless STRATA_GLM_BACK_STAY=0
+    std::atomic<bool> link_busy{false};
+    namespace gl = strata::core::glmlink;
+    static const bool back_stay = gl::role() == gl::kBack && !(getenv("STRATA_GLM_BACK_STAY") && atoi(getenv("STRATA_GLM_BACK_STAY")) == 0);
     if (o.serve) {
         std::thread([&] {
             std::string l, buf;
@@ -1226,9 +1233,24 @@ static int glm_pack_generate(const Options& o) {
 #if defined(_WIN32)
                     const int n = _read(0, chunk, (unsigned) sizeof chunk);
 #else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    const ssize_t n = ::read(strata::core::glmlink::ctl_fd() >= 0 ? strata::core::glmlink::ctl_fd() : 0, chunk, sizeof chunk)   /* two-box back: the link */;
                     if (n < 0 && errno == EINTR) continue;
 #endif
+                    if (n <= 0 && back_stay) {
+                        // THE FRONT HAS GONE (or connects again): what it sent and was not started is dropped, the
+                        // main thread leaves the old link, and the back waits for the next front
+                        gl::wake();
+                        {
+                            std::lock_guard<std::mutex> lk(in_mu);
+                            in_lines.clear();
+                        }
+                        while (link_busy.load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        buf.clear();
+                        std::string re;
+                        if (gl::reaccept(re)) continue;
+                        std::fprintf(stderr, "%s - the back ends\n", re.c_str());
+                        return false;
+                    }
                     if (n <= 0) {
                         if (buf.empty()) return false;
                         out.swap(buf);
@@ -1241,6 +1263,12 @@ static int glm_pack_generate(const Options& o) {
             while (getline_fd(l)) {
                 strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
+                // the two-box split: the front forwards each command as its main thread starts it (the serve loop);
+                // STOP, PAUSE and WRAP act on the front alone - the back follows its verdicts in the request's messages
+                // (and a staying back ignores QUIT: the next front comes)
+                if (gl::role() == gl::kBack && (l.rfind("STOP", 0) == 0 || l.rfind("PAUSE", 0) == 0 || l == "WRAP" ||
+                                                 (back_stay && l == "QUIT")))
+                    continue;
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
                     std::istringstream ls(l);
@@ -1276,6 +1304,7 @@ static int glm_pack_generate(const Options& o) {
                 in_lines.push_back(l);
                 in_cv.notify_one();
             }
+            strata::core::glmlink::ctl_close();   // (the two-box split's front: the back sees the end of its input too)
             std::lock_guard<std::mutex> lk(in_mu);
             in_eof = true;
             in_cv.notify_one();
@@ -1289,6 +1318,7 @@ static int glm_pack_generate(const Options& o) {
         if (in_lines.empty()) return false;   // EOF or QUIT with nothing queued behind it
         out = std::move(in_lines.front());
         in_lines.pop_front();
+        link_busy.store(true);
         return true;
     };
 
@@ -1437,6 +1467,8 @@ static int glm_pack_generate(const Options& o) {
     if (slot_max > 0 && !slot_ram) {
         slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
                                                  : std::filesystem::path(o.glm_pack) / "slots";
+        if (strata::core::glmlink::role() != strata::core::glmlink::kNone)   // (two processes on one pack: one directory each)
+            slot_dir += std::string("-") + strata::core::glmlink::role_name();
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
         struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; uint64_t img; };
@@ -1838,6 +1870,33 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (reuse == 0) model.reset();
+        // THE TWO-BOX SPLIT: both sides must go on from the same state - each one's reuse (snapshot, checkpoint, slot)
+        // against the other's; when they differ (one side restarted, a slot only one has, a state one side dropped),
+        // both read the prompt from token 0.  The decode mode must match too.
+        if (gl::role() != gl::kNone) {
+            int64_t peer = -1;
+            int32_t pmode = -1;
+            const int32_t mode = model.spec_ready() ? 1 : 0;
+            if (!gl::begin_exchange((int64_t) reuse, mode, peer, pmode, err)) {
+                std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
+                return 1;
+            }
+            if (pmode != mode) {
+                err = std::string("glm link: the ") + gl::role_name() + (mode ? " decodes speculatively" : " decodes plainly") +
+                      ", the other side does not (STRATA_GLM_NO_SPEC must match; the back needs the NextN block)";
+                gl::abort_link(err);
+                std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
+                return 1;
+            }
+            if (peer != (int64_t) reuse) {
+                std::fprintf(stderr, "glm link: this side goes on from %zu tokens, the other from %lld - both read the "
+                             "prompt from 0\n", reuse, (long long) peer);
+                if (reuse > 0) model.reset();
+                reuse = 0;
+                snap_tokens.clear();
+                from_ckpt = false;
+            }
+        }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
         // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
@@ -2061,6 +2120,10 @@ static int glm_pack_generate(const Options& o) {
             if (model.fast() && !snapped && i < snap_at && i + chunk > snap_at) chunk = snap_at - i;
             std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
             const bool ok = model.forward(part, lg, err);
+            if (!ok && gl::cancelled()) {   // (the two-box back: the front stopped the read)
+                finish = "cancel";
+                break;
+            }
             if (!ok) {
                 snap_tokens.clear();
                 drop_if_poisoned(prompt, err);
@@ -2145,6 +2208,7 @@ static int glm_pack_generate(const Options& o) {
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
+        gl::request_begin();
         stop_req.store(false);
         pause_req.store(false);
         pause_keep.store(false);
@@ -2330,30 +2394,78 @@ static int glm_pack_generate(const Options& o) {
             // running the NextN block's draft (same tokens as the loop below)
             int64_t n_spec = 0;
             if (!model.decode_spec(sp, max_new, on_token, n_spec, err)) {
-                drop_if_poisoned(prompt, err);
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
+                if (gl::cancelled()) {
+                    finish = "cancel";   // (the two-box back: the front ended the request)
+                } else {
+                    drop_if_poisoned(prompt, err);
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
             }
         } else {
+            // (the two-box split: after each token the front's verdict and pending force go to the back - kCtl - so a
+            // STOP, a WRAP or the budget's force lands at the same token on both sides)
+            const bool lfront = gl::role() == gl::kFront, lback = gl::role() == gl::kBack;
             for (;;) {
-                if (stop_req.load()) {
+                // (a read that ended cancelled - on the two-box back by the front's kEnd, where stop_req is never set)
+                if (stop_req.load() || std::strcmp(finish, "cancel") == 0) {
                     finish = "cancel";
                     break;
                 }
                 int tok = model.sample_token(sp, err);
                 if (tok < 0) {
+                    if (lback && gl::cancelled()) { finish = "cancel"; break; }
                     drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
                 tok = model.forced(tok);
                 sp.counter += 1;
-                if (!on_token(tok)) break;
+                bool more = on_token(tok);
+                if (lfront && !gl::send_pair(gl::kCtl, model.position(), more ? 1 : 0, model.force_pending())) {
+                    err = "glm link: down";
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                if (lback) {
+                    int32_t v = 0, fz = -1;
+                    if (!gl::recv_pair(gl::kCtl, model.position(), v, fz, err)) {
+                        if (gl::cancelled()) { finish = "cancel"; break; }
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    model.force_next(fz);
+                    more = v != 0;
+                }
+                if (!more) break;
                 if (!model.forward({(int32_t) tok}, lg, err)) {
+                    if (lback && gl::cancelled()) { finish = "cancel"; break; }
                     drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+            }
+        }
+        // THE TWO-BOX SPLIT's end of a request: the front's kEnd (with its PAUSE verdict), the back's kAck; both must
+        // stand at the same position, else both drop the conversation's state (the next prompt is read from 0)
+        int lflags = pause_req.load() && std::strcmp(finish, "cancel") == 0 ? 1 | (pause_keep.load() ? 2 : 0) : 0;
+        if (gl::role() != gl::kNone) {
+            std::string le;
+            bool agree = true, lok;
+            if (gl::role() == gl::kFront) {
+                lok = gl::up() && gl::end_front(model.position(), lflags, agree, le);
+            } else {
+                lflags = 0;
+                lok = gl::up() && gl::end_back(model.position(), lflags, agree, le);
+                if (lflags & 1) finish = "cancel";
+            }
+            if (!lok || !agree) {
+                std::fprintf(stderr, "glm link: the request ends %s - the conversation's state is dropped on this side\n",
+                             !lok ? (le.empty() ? "with the link down" : le.c_str()) : "at another position on each side");
+                snap_tokens.clear();
+                ckpt_drop_past(0);
+                model.reset();
+                lflags = 0;
             }
         }
         const auto t2 = std::chrono::steady_clock::now();
@@ -2367,7 +2479,7 @@ static int glm_pack_generate(const Options& o) {
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
-        if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
+        if (lflags & 1) pause_snapshot(prompt, emitted, (lflags & 2) != 0);
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {
@@ -4068,6 +4180,7 @@ static int glm_pack_generate(const Options& o) {
     };
     std::string line;
     for (;;) {
+        link_busy.store(false);
         if (multi && !pending.empty()) admit_pending();
         if (multi && !gens.empty()) {   // requests running: a line when one is there, else one scheduler step
             if (!try_line(line)) {
@@ -4080,6 +4193,20 @@ static int glm_pack_generate(const Options& o) {
             }
         } else if (!next_line(line)) {
             break;
+        }
+        // THE TWO-BOX SPLIT's front: each command goes to the back as it starts here (a link that went down connects
+        // again first; a back that is not there fails the command)
+        if (gl::role() == gl::kFront) {
+            if (!gl::idle_check()) {
+                std::string le;
+                if (!gl::reopen(le)) {
+                    if (line.rfind("QUIT", 0) == 0) break;
+                    std::printf("ERR %s\n", le.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
+            gl::ctl_send_line(line);
         }
         std::istringstream ss(line);
         std::string cmd;
@@ -4352,7 +4479,10 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             model.set_image_rows(cur_img_pos, cur_img_rows);
-            run_request(toks, max_new, rq);
+            // (the two-box split: a request that failed takes the link down - the next command connects again and
+            // both sides' states are checked then)
+            if (run_request(toks, max_new, rq) != 0 && gl::role() != gl::kNone && gl::up())
+                gl::abort_link(std::string("the request failed on the ") + gl::role_name());
             model.set_image_rows({}, {});
             continue;
         }
@@ -4585,6 +4715,8 @@ int main(int argc, char** argv) {
         else if (a == "--stop-eos") { o.stop_eos = true; o.eos_given = true; }
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+        else if (a == "--role") set_env("STRATA_GLM_ROLE", next("--role"));   // the two-box split (glm_link.hpp)
+        else if (a == "--link") set_env("STRATA_GLM_LINK", next("--link"));
         else if (a == "--dflash") o.dflash = next("--dflash");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
