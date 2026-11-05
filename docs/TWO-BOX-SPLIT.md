@@ -65,6 +65,50 @@ up and accepts the front again. Speculative decoding (MTP) is pipelined across t
 
 Also set an API key on the front's server (`STRATA_API_KEY`) if the port is reachable from your network.
 
+## Several conversations at once (`--parallel`)
+
+`--parallel N` works over the link with the split's batched rows. Give **both** sides the same `--parallel N`,
+`MAYA_GLM_SPLIT_ROWS` and `MAYA_GLM_SEQ_CTX` (the back: on its command line / environment; the front: in `"args"` and
+`"env"`):
+
+```json
+"args": [ "...", "--parallel", "4" ],
+"env":  { "MAYA_GLM_SPLIT_ROWS": "2", "MAYA_GLM_EVEN_GROUPS": "1", "MAYA_GLM_SEQ_CTX": "32768" }
+```
+
+Both sides run the several-conversation scheduler in lock step. The front sends its own decisions to the back (take
+a new request now or decode a step; for every token: go on, stop, cancel, pause, forced token), and the back follows
+them. Each decode row crosses the link on its own (one hop per row, one token back). The front queues what it sends
+behind rows that are not ready yet and keeps going; the back sends each token as soon as it is picked. A group that
+gets its token back is issued again while the other group is still on the front, so both machines stay busy.
+
+Measured on the same 2 × 4× RTX 3060 rigs (greedy 400-token answers, short prompts):
+
+| | tok/s per request | tok/s in all |
+|---|---|---|
+| 1 request (any setting: it takes the speculative path) | 40–43 | 40–43 |
+| 2 at once, `--parallel 2`, `SPLIT_ROWS=2` (one group of 2 rows) | 16–17 | 33 |
+| 2 at once, `--parallel 2`, `SPLIT_ROWS=1` (two groups, pipelined) | 24 | 48 |
+| 2 at once, `--parallel 4`, `SPLIT_ROWS=2`, `EVEN_GROUPS=1` | 25–26 | 50–52 |
+| 4 at once, `--parallel 4`, `SPLIT_ROWS=2`, `EVEN_GROUPS=1` | 14.5 | 58 |
+
+Two agent turns at once (~2K new tokens each on ~9–10K cached tokens, 128-token answers): 14.7 and 16.1 s, against
+8.6–9.3 s for one turn alone. The prompts are still read one at a time. Cancelling one of two running requests ends
+only that one; the other finishes and the link stays up.
+
+Limits:
+- Needs `MAYA_GLM_SPLIT_ROWS` ≥ 1 and at least 2 GPUs on each side. Without them the engine stops at startup.
+- `MAYA_GLM_MULTI_MTP`, `MAYA_GLM_PREFILL_INTERLEAVE` and `MAYA_GLM_PREFILL_GAPS` are turned off over the link.
+- A STOP during a prompt's read takes effect at the request's first token.
+- A failure on either side ends every running request on both sides. The link drops and the front reconnects at
+  its next request.
+- Both sides must run this build when `--parallel` is above 1. With `--parallel 1` (the default) nothing changes.
+- The gain comes from keeping both machines busy. A single request already decodes speculatively (the NextN
+  drafts), so two conversations give ×1.2 and four ×1.45 in all over one request. That is below Maya's ×1.6–2.5 on one
+  box.
+- Greedy answers of concurrent requests match a request alone until the first near-tie between two tokens. Production
+  runs of the same prompt split at the same places, because expert placement changes the order sums are done in.
+
 ## Correctness
 
 Teacher-forced logits (`STRATA_GLM_KL_DUMP` with `maya generate --tokens-file`) against a single-process run on one
@@ -78,3 +122,4 @@ the top-8 expert choice flip on rounding. A split whose expert tiers match a sin
   chunk and turns took ~31 s; with 20 + 32 GB nothing is read from disk.
 - Bigger prompt chunks (`--prefill auto`) need more pinned host RAM on both sides.
 - Tested on Linux with CUDA 13.2, sm_86, on Project Maya v1.1.50.
+- RAM with `--parallel 4` at 32K for the extra conversations: the front box (20 GB) kept ≥ 3.9 GB available.
