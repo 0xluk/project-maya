@@ -121,5 +121,10 @@ the top-8 expert choice flip on rounding. A split whose expert tiers match a sin
 - Host RAM matters more than the network: with 16 GB per box part of the experts came from SATA SSD on every prompt
   chunk and turns took ~31 s; with 20 + 32 GB nothing is read from disk.
 - Bigger prompt chunks (`--prefill auto`) need more pinned host RAM on both sides.
-- Tested on Linux with CUDA 13.2, sm_86, on Project Maya v1.1.50.
+- Tested on Linux with CUDA 13.2, sm_86, on Project Maya v1.1.54 (first built on v1.1.50). On v1.1.54, against the
+  v1.1.50 build on the same two boxes: short decode 41.3 vs 39.9 tok/s, decode after a 25K prompt 37.4 vs 36.3 tok/s,
+  a ~2K-token turn on 10K cached 11.2 vs 11.8 s; teacher-forced KL vs the single-process reference 2.08e-2 (top-1
+  96.9%); the same greedy answers.
+- Over the link the speculative decode always takes the pipelined path (decode_spec_link): `MAYA_GLM_SPEC_WIN`
+  (the MTP verify window through a one-box split, new upstream) is ignored when `--role` is set.
 - RAM with `--parallel 4` at 32K for the extra conversations: the front box (20 GB) kept ≥ 3.9 GB available.
