@@ -18,7 +18,9 @@ constexpr int kThreads = 512;
 constexpr int kFlagStride = 16;            // flags 64 B apart
 constexpr size_t kInMax = 32 << 10;        // largest broadcast (q8_1 of 16384 values: 18 KB)
 constexpr size_t kOutMax = 32 << 10;       // largest helper output (3 x 2048 floats: 24 KB)
-constexpr unsigned long long kSpinNs = 3000000000ull;
+// a helper's wait for the owner's input has no limit (the owner's stream may sit on the link or between requests
+// for minutes); the owner's wait for the helpers' rows (their input is out by then) gives up after kSpinNs
+constexpr unsigned long long kSpinNs = 20000000000ull;
 
 __device__ __forceinline__ unsigned long long gtime() {
     unsigned long long t;
@@ -27,13 +29,13 @@ __device__ __forceinline__ unsigned long long gtime() {
 }
 
 // thread 0 of the block waits for flag == seq (or times out and raises *err)
-__device__ __forceinline__ void wait_flag(const unsigned* flag, unsigned seq, unsigned* err) {
-    if (threadIdx.x == 0) {
+__device__ __forceinline__ void wait_flag(const unsigned* flag, unsigned seq, unsigned* err, bool limit = true) {
+    if (threadIdx.x == 0 && flag != nullptr) {   // (nullptr: an event ordered this kernel after the writer)
         const volatile unsigned* f = flag;
         const unsigned long long t0 = gtime();
         while (*f != seq) {
             __nanosleep(32);
-            if (gtime() - t0 > kSpinNs) {
+            if (limit && gtime() - t0 > kSpinNs) {
                 *(volatile unsigned*) err = 1u;
                 break;
             }
@@ -57,7 +59,7 @@ __global__ void k_put(const uint32_t* __restrict__ src, int words, uint32_t* hos
 __global__ void k_fetch(const uint32_t* host, int words, uint32_t* __restrict__ dst, unsigned* flags, unsigned seq,
                         unsigned* err) {
     const int b = blockIdx.x;
-    wait_flag(flags + b * kFlagStride, seq, err);
+    wait_flag(flags ? flags + b * kFlagStride : nullptr, seq, err, false);
     const int w0 = (int) ((long long) words * b / kBlocks), w1 = (int) ((long long) words * (b + 1) / kBlocks);
     for (int i = w0 + (int) threadIdx.x; i < w1; i += blockDim.x) dst[i] = __ldcv((const unsigned int*) host + i);
 }
@@ -73,7 +75,7 @@ struct CollectJobs {
 // the owner: block (b, h) waits for helper h's flag b and scatters that word range into the jobs' outputs
 __global__ void k_collect(CollectJobs c, unsigned seq, unsigned* err) {
     const int b = blockIdx.x, h = blockIdx.y;
-    wait_flag(c.flags[h] + b * kFlagStride, seq, err);
+    wait_flag(c.flags[h] ? c.flags[h] + b * kFlagStride : nullptr, seq, err);
     const int words = c.off[h][c.nj];
     const int w0 = (int) ((long long) words * b / kBlocks), w1 = (int) ((long long) words * (b + 1) / kBlocks);
     for (int i = w0 + (int) threadIdx.x; i < w1; i += blockDim.x) {
@@ -106,6 +108,7 @@ struct Helper {
     cudaStream_t s = nullptr;
     uint8_t* x = nullptr;    // the broadcast input on the helper
     float* y = nullptr;      // its output rows
+    cudaEvent_t done = nullptr;   // its rows are in the host slot
     uint32_t* host = nullptr;
     unsigned* flags = nullptr;
 };
@@ -114,6 +117,7 @@ struct Owner {
     unsigned seq = 0;
     uint32_t* bhost = nullptr;   // the broadcast slot
     unsigned* bflags = nullptr;
+    cudaEvent_t pub = nullptr;   // the input is in the host slot
     std::vector<Helper> helpers;
     std::map<int, GroupState> groups;   // il * kGroups + grp
     float* chk = nullptr;                // MAYA_GLM_TP_CHECK
@@ -127,6 +131,15 @@ struct Ctx {
     std::vector<int> dev_of;
 };
 Ctx* g_ctx = nullptr;
+
+// CUDA's lazy module loading synchronizes a device the first time one of its kernels runs.  With a helper's stream
+// spinning on its owner's input that wait can never end (the host thread that would let the owner on is the one
+// loading), so TP decode loads every module at context creation - before main(), ahead of any CUDA call.
+const int g_eager = [] {
+    const char* v = getenv("MAYA_GLM_TP_DECODE");
+    if (v != nullptr && std::atoi(v) != 0 && getenv("CUDA_MODULE_LOADING") == nullptr) setenv("CUDA_MODULE_LOADING", "EAGER", 1);
+    return 0;
+}();
 
 int64_t split_point(int64_t n, int k, int parts) {
     // 32-row aligned quarters
@@ -214,6 +227,8 @@ bool setup(const std::vector<PartDesc>& parts, std::string& err) {
         o->bhost = (uint32_t*) base;
         o->bflags = (unsigned*) (base + kInMax);
         base += kInMax + flag_bytes;
+        cudaSetDevice(o->dev);
+        cudaEventCreateWithFlags(&o->pub, cudaEventDisableTiming);
         for (int hi = 0, q = 0; q < P; ++q) {
             if (q == pi) continue;
             Helper h;
@@ -227,6 +242,7 @@ bool setup(const std::vector<PartDesc>& parts, std::string& err) {
                 teardown();
                 return false;
             }
+            cudaEventCreateWithFlags(&h.done, cudaEventDisableTiming);
             h.x = (uint8_t*) dalloc(h.dev, kInMax);
             h.y = (float*) dalloc(h.dev, kOutMax);
             if (!h.x || !h.y) { err = "glm tp: helper buffers"; teardown(); return false; }
@@ -317,7 +333,11 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
     unsigned* err = g_ctx->err;
     const int words_in = (int) (in_bytes / 4);
     // 1. the owner publishes the q8_1 input
+    // MAYA_GLM_TP_SPIN=1: the helpers' and the owner's waits spin on host flags; default: CUDA events order them (no
+    // kernel ever spins, so nothing can starve or deadlock behind a waiting kernel)
+    static const bool spin = getenv("MAYA_GLM_TP_SPIN") != nullptr && std::atoi(getenv("MAYA_GLM_TP_SPIN")) != 0;
     k_put<<<kBlocks, kThreads, 0, s>>>((const uint32_t*) xq, words_in, o->bhost, o->bflags, seq);
+    if (!spin) cudaEventRecord(o->pub, s);
     // 2. the owner's own rows (and its other jobs) in one launch
     gf::MvJob J[gf::kMaxMvJobs];
     int nj = 0;
@@ -337,7 +357,8 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
     for (int h = 0; h < c.nh; ++h) {
         Helper& H = o->helpers[(size_t) h];
         cudaSetDevice(H.dev);
-        k_fetch<<<kBlocks, kThreads, 0, H.s>>>(o->bhost, words_in, (uint32_t*) H.x, o->bflags, seq, err);
+        if (!spin) cudaStreamWaitEvent(H.s, o->pub, 0);
+        k_fetch<<<kBlocks, kThreads, 0, H.s>>>(o->bhost, words_in, (uint32_t*) H.x, spin ? o->bflags : nullptr, seq, err);
         gf::MvJob HJ[kMaxJobs];
         int off = 0;
         c.off[h][0] = 0;
@@ -356,11 +377,14 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
         }
         if (!gf::mv(HJ, n, H.s)) ok = false;
         k_put<<<kBlocks, kThreads, 0, H.s>>>((const uint32_t*) H.y, off, H.host, H.flags, seq);
+        if (!spin) cudaEventRecord(H.done, H.s);
         c.host[h] = H.host;
-        c.flags[h] = H.flags;
+        c.flags[h] = spin ? H.flags : nullptr;
     }
     gf::set_skip(skip);
     cudaSetDevice(dev);
+    if (!spin)
+        for (auto& H : o->helpers) cudaStreamWaitEvent(s, H.done, 0);
     // 4. the owner gathers the helpers' rows
     k_collect<<<dim3(kBlocks, c.nh), kThreads, 0, s>>>(c, seq, err);
     static const bool check = getenv("MAYA_GLM_TP_CHECK") != nullptr;
@@ -377,7 +401,7 @@ bool mv(int dev, int il, int grp, const gf::MvJob* split, int n, const gf::MvJob
             gf::mv(&f, 1, s);
             k_cmp<<<16, 256, 0, s>>>((const uint32_t*) o->chk, (const uint32_t*) split[j].y, split[j].n_out, bad, checked);
         }
-        if (seq % 2000 == 0) {
+        if (seq % 250 == 0) {
             unsigned h[2] = {0, 0};
             cudaMemcpyAsync(h, bad, sizeof(h), cudaMemcpyDeviceToHost, s);
             cudaStreamSynchronize(s);
