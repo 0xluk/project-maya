@@ -563,6 +563,9 @@ public:
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
     bool fast_setup_finish(std::string& err);
+    // MAYA_GLM_TP_DECODE (glm_tp_decode.cu): the split's GEMV slices, after every part loaded
+    bool tp_decode_setup(const std::vector<Glm5Model*>& parts, std::string& err);
+    bool tp_pass_ = false;   // fast_layers' pass splits its GEMVs (fast_dsa reads it)
     bool dual_prefill_ready();   // STRATA_GLM_DUAL_PREFILL (glm_prefill.cu)
     int dual_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     bool calc_prefill_ready();   // STRATA_GLM_PREFILL_CALC (glm_prefill.cu)
